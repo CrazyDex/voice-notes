@@ -103,7 +103,22 @@ async function run({ id, audio, language }) {
   try {
     const opts = { task: 'transcribe' };
     if (LANG[language]) opts.language = LANG[language];
-    if (audio.length > 16000 * 29) { opts.chunk_length_s = 30; opts.stride_length_s = 5; }
+    const sec = audio.length / 16000;
+    if (sec > 29) { opts.chunk_length_s = 30; opts.stride_length_s = 5; }
+    else {
+      // Предел длины ответа: на тишине/шуме Whisper иногда зацикливается и генерирует сотни токенов
+      opts.max_new_tokens = Math.min(400, Math.ceil(sec * 7) + 16);
+      // Пульс из распознавания: в журнале видно, дошло ли до текста и сколько токенов выдано
+      let toks = 0;
+      opts.streamer = {
+        put() {
+          toks++;
+          if (toks === 1) postMessage({ type: 'trace', text: `первый шаг через ${((performance.now() - t0) / 1000).toFixed(1)} с` });
+          else if (toks % 8 === 0) postMessage({ type: 'trace', text: `токенов ${toks} (${((performance.now() - t0) / 1000).toFixed(1)} с)`, replace: 'распознавание: токенов' });
+        },
+        end() {},
+      };
+    }
     const out = await asr(audio, opts);
     postMessage({ type: 'result', id, text: (out?.text || '').trim(), ms: Math.round(performance.now() - t0), dur: audio.length / 16000 });
   } catch (e) {

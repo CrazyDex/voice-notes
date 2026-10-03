@@ -122,7 +122,7 @@ export class Recorder {
     for (const c of arr) { out.set(c, o); o += c.length; }
     return out;
   }
-  get seconds() { return this.samples / 16000; }
+  get seconds() { return (this.samples || 0) / 16000; }
   async stop() {
     try { this.node.port.onmessage = null; this.src.disconnect(); this.node.disconnect(); } catch {}
     this.stream.getTracks().forEach((t) => t.stop());

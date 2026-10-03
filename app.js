@@ -1,4 +1,4 @@
-import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.5';
+import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.6';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -15,7 +15,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.5';
+const VERSION = '0.6';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -125,7 +125,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=0.5', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=0.6', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -158,6 +158,7 @@ const ASR = {
   get queue() { return this.pending.size; },
   on(m) {
     if (m.type === 'boot') { this.isolated = m.isolated; }
+    else if (m.type === 'trace') { trace('распознавание: ' + m.text, m.replace); return; }
     else if (m.type === 'status') { this.msg = m.text; trace('модель: ' + m.text); if (m.stage) { const g = ls.get('vn.loading', null); if (g) ls.set('vn.loading', { ...g, device: m.stage.dev }); } }
     else if (m.type === 'progress') {
       if (m.filePct === 100) trace(`скачан ${m.file} (${m.fileMB.toFixed(0)} МБ)`);
@@ -207,6 +208,7 @@ function clean(t) {
   t = (t || '').trim();
   if (!t || /^[\s.,!?…\-–—]*$/.test(t)) return '';
   if (t.length < 90 && HALL.some((r) => r.test(t))) return '';
+  if (/^[\[(][^\])]*[\])]$/.test(t)) return ''; // «[музыка]», «(аплодисменты)»
   return t;
 }
 const jobs = new Map(); // noteId -> {total, done}
@@ -781,7 +783,7 @@ async function importJSON(e) {
   const crashed = wasAlive ? ls.get('vn.loading', null) : null;
   ls.set('vn.loading', null);
   const lastStep = ls.get('vn.log', []).slice(-1)[0] || '';
-  const inAsr = /распознавание: кусок/.test(lastStep);
+  const inAsr = /распознавание: (кусок|первый|токенов)/.test(lastStep);
   markAlive(true);
   if (crashed || (wasAlive && inAsr)) {
     ls.set('vn.loading', null);
