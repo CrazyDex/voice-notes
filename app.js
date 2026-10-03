@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.8';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.9';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -17,7 +17,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.8';
+const VERSION = '0.9';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -133,7 +133,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=0.8', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=0.9', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -389,9 +389,35 @@ async function rec_stop(r) { try { return await r.stop(); } catch { return new F
 
 /* ================= Встроенное распознавание (Web Speech API) ================= */
 // Safari обрывает сессию распознавания на паузах и примерно через минуту — перезапускаем, пока идёт запись.
+// Встроенное распознавание не ставит знаков. Голосовые команды («запятая», «точка», «вопросительный знак»,
+// «новая строка»…) превращаем в знаки, конец фразы (пауза) — в точку, начало предложения — с заглавной.
+const PUNCT_CMDS = [
+  [/(^|\s)вопросительный знак(?=\s|$)/giu, '?'],
+  [/(^|\s)восклицательный знак(?=\s|$)/giu, '!'],
+  [/(^|\s)многоточие(?=\s|$)/giu, '…'],
+  [/(^|\s)двоеточие(?=\s|$)/giu, ':'],
+  [/(^|\s)точка с запятой(?=\s|$)/giu, ';'],
+  [/(^|\s)запятая(?=\s|$)/giu, ','],
+  [/(^|\s)точка(?=\s|$)(?!\s+зрения)/giu, '.'],
+  [/(^|\s)(новая строка|с новой строки|новый абзац)(?=\s|$)/giu, '\n'],
+];
+function punctuate(t, final) {
+  t = (t || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  for (const [re, ch] of PUNCT_CMDS) t = t.replace(re, ch);
+  t = t.replace(/ *\n */g, '\n').replace(/\s+([,.!?:;…])/g, '$1').replace(/([,.!?:;…])(?=[^\s,.!?:;…\n])/g, '$1 ');
+  // Apple начинает новое предложение с заглавной, но без точки — ставим точку перед ним
+  t = t.replace(/(\p{Ll})\s+(?=\p{Lu}\p{Ll})/gu, '$1. ');
+  // заглавная в начале и после .!?… и переноса строки
+  t = t.replace(/(^|[.!?…]\s+|\n)(\p{Ll})/gu, (m, a, b) => a + b.toUpperCase());
+  if (final && !/[.!?…:;,]$/.test(t)) t += '.';
+  if (final) t = t.replace(/,$/, '.');
+  return t;
+}
+
 const Sys = {
   r: null, on: false, done: [], cur: '', note: null, err: '', quick: 0, endWait: null,
-  texts() { return [...this.done, this.cur].map((t) => t.trim()).filter(Boolean); },
+  texts() { return [...this.done.map((t) => punctuate(t, true)), punctuate(this.cur, false)].filter(Boolean); },
   start(note) {
     this.note = note; this.on = true; this.done = []; this.cur = ''; this.err = ''; this.quick = 0;
     this.spawn();
