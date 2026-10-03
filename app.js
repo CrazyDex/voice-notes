@@ -1,8 +1,10 @@
-import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.6';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.7';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-const DEFAULTS = { model: IS_IOS ? 'base' : 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true };
+// Встроенное распознавание браузера (на iPhone — то же, что диктовка Siri)
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const DEFAULTS = { engine: SR && IS_IOS ? 'sys' : 'whisper', model: IS_IOS ? 'base' : 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true };
 const MODELS = {
   tiny: { name: 'Tiny', size: '~45 МБ', note: 'Самая лёгкая. Много ошибок, но почти наверняка не вылетит — для проверки, что всё работает.' },
   base: { name: 'Base', size: '~80 МБ', note: 'Быстро и надёжно, но больше ошибок. Лучший вариант для «живого» текста на iPhone.' },
@@ -15,10 +17,14 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.6';
+const VERSION = '0.7';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
+// v0.7: Whisper в Safari на iPhone вылетает при распознавании — переводим на встроенное распознавание
+if (IS_IOS && SR && !ls.get('vn.mig07', false)) { S.engine = 'sys'; ls.set('vn.mig07', true); saveS(); }
+if (!SR) S.engine = 'whisper';
+const useSys = () => S.engine === 'sys' && !!SR;
 // На iPhone WebGPU-версия Whisper упирается в лимит памяти Safari — по умолчанию считаем на CPU
 function effDevice() { return S.device === 'auto' && IS_IOS ? 'wasm' : S.device; }
 // На iPhone многопоточный WebAssembly с общей памятью — частая причина вылетов Safari, поэтому там один поток
@@ -125,7 +131,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=0.6', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=0.7', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -185,6 +191,7 @@ const ASR = {
 };
 
 function asrStatusHTML() {
+  if (useSys()) return `<span class="dot ok"></span><span>Встроенное распознавание ${IS_IOS ? 'iPhone' : 'браузера'}</span>`;
   const name = MODELS[S.model].name;
   let cls = '', txt;
   if (ASR.state === 'ready') { cls = 'ok'; txt = `${name} · ${ASR.info.device === 'webgpu' ? 'WebGPU' : 'CPU×' + ASR.info.threads} · готово`; }
@@ -247,6 +254,7 @@ function finishIfDone(note) {
 let rec = null, recNote = null, recTimer = null, wake = null, segIndex = 0;
 
 function recInfo() {
+  if (useSys()) return 'Встроенное распознавание' + (Sys.err ? ' · ' + Sys.err : '');
   const j = recNote && jobs.get(recNote.id);
   const parts = [MODELS[S.model].name];
   if (ASR.state === 'loading') parts.push(ASR.msg || 'загрузка модели');
@@ -262,17 +270,21 @@ async function startRecording() {
     tags: [], projectId: filter.project && filter.project !== 'none' ? filter.project : null, status: 'recording',
   };
   if (filter.tag) note.tags.push(filter.tag);
-  trace('запись: нажата кнопка');
-  rec = new Recorder();
+  const sys = useSys();
+  trace('запись: нажата кнопка' + (sys ? ' (встроенное распознавание)' : ''));
+  // если встроенное распознавание не уживается с нашей записью звука — пишем только текст
+  rec = sys && ls.get('vn.sysNoRec', false) ? new NullRecorder() : new Recorder();
   segIndex = 0;
   try {
+    if (sys) Sys.start(note);
     await rec.start({
       segOpts: { minSec: 3, maxSec: S.segMax, silenceMs: 500 },
-      onSegment: (a) => enqueue(note, a, segIndex++),
+      onSegment: (a) => { if (!sys) enqueue(note, a, segIndex++); },
       log: trace,
     });
   } catch (e) {
     rec = null;
+    if (sys) Sys.abort();
     trace('запись: ошибка ' + (e?.name || '') + ' ' + (e?.message || e));
     toast(e?.name === 'NotAllowedError' ? 'Нет доступа к микрофону. Разрешите его в настройках Safari.' : 'Микрофон недоступен: ' + (e?.message || e), 4500);
     return;
@@ -297,7 +309,7 @@ async function startRecording() {
     saveNote(note);
   }, 5000);
   // модель грузим чуть позже, чтобы запись точно успела стартовать
-  if (!ls.get('vn.safe', false)) setTimeout(() => ASR.ensure(), 300);
+  if (!sys && !ls.get('vn.safe', false)) setTimeout(() => ASR.ensure(), 300);
 }
 let recSaver = null;
 
@@ -306,11 +318,13 @@ async function stopRecording() {
   clearInterval(recTimer); clearInterval(recSaver);
   const r = rec; rec = null;
   trace('запись: стоп');
-  const pcm = await r.stop();
-  const note = recNote; recNote = null;
+  const note = recNote;
+  if (Sys.note === note) { await Sys.stop(); note.segTexts = Sys.texts(); note.text = joinSegs(note); Sys.note = null; }
+  recNote = null;
+  const pcm = await rec_stop(r);
   try { await wake?.release(); } catch {}
   wake = null;
-  note.duration = pcm.length / 16000;
+  note.duration = pcm.length ? pcm.length / 16000 : r.seconds;
   if (S.keepAudio && pcm.length) { await DB.put('audio', encodeWav(pcm), note.id); note.hasAudio = true; }
   for (let i = 0; i < (note.parts || 0); i++) await DB.del('audio', note.id + ':p' + i);
   note.parts = 0;
@@ -367,6 +381,67 @@ function onNoteChanged(note) {
   else if (r.name === 'home') renderList();
   asrUI();
 }
+
+// запись могла быть подменена заглушкой во время работы (см. Sys) — останавливаем то, что есть
+async function rec_stop(r) { try { return await r.stop(); } catch { return new Float32Array(0); } }
+
+/* ================= Встроенное распознавание (Web Speech API) ================= */
+// Safari обрывает сессию распознавания на паузах и примерно через минуту — перезапускаем, пока идёт запись.
+const Sys = {
+  r: null, on: false, done: [], cur: '', note: null, err: '', quick: 0, endWait: null,
+  texts() { return [...this.done, this.cur].map((t) => t.trim()).filter(Boolean); },
+  start(note) {
+    this.note = note; this.on = true; this.done = []; this.cur = ''; this.err = ''; this.quick = 0;
+    this.spawn();
+  },
+  spawn() {
+    const r = new SR();
+    this.r = r;
+    r.lang = { ru: 'ru-RU', en: 'en-US' }[S.lang] || navigator.language || 'ru-RU';
+    r.continuous = true;
+    r.interimResults = true;
+    const t0 = Date.now();
+    r.onstart = () => trace('встроенное: слушаю');
+    r.onresult = (e) => {
+      let t = '';
+      for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript + ' ';
+      this.cur = t.replace(/\s+/g, ' ').trim();
+      this.quick = 0;
+      if (this.note) { this.note.segTexts = this.texts(); this.note.text = joinSegs(this.note); updateRecLive(); saveNote(this.note, 500); }
+    };
+    r.onerror = (e) => {
+      trace('встроенное: ошибка ' + e.error + (e.message ? ' ' + e.message : ''));
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        this.on = false; this.err = 'нет разрешения';
+        toast('Распознавание речи запрещено. Включите Siri и Диктовку: Настройки iPhone → Основные → Клавиатура → «Включить диктовку».', 7000);
+      } else if (e.error === 'audio-capture' && rec && !(rec instanceof NullRecorder)) {
+        // микрофон занят нашей записью звука: дальше пишем только текст
+        ls.set('vn.sysNoRec', true);
+        trace('встроенное: отключаю запись звука, чтобы освободить микрофон');
+        const old = rec; rec = new NullRecorder(old.seconds); rec.start(); old.stop().catch(() => {});
+      } else if (e.error !== 'no-speech' && e.error !== 'aborted') this.err = e.error;
+    };
+    r.onend = () => {
+      if (this.cur) this.done.push(this.cur);
+      this.cur = '';
+      if (this.endWait) { const f = this.endWait; this.endWait = null; f(); return; }
+      if (!this.on) return;
+      if (Date.now() - t0 < 1500 && ++this.quick > 5) { this.on = false; this.err = 'распознавание не запускается'; trace('встроенное: не запускается, сдаюсь'); updateRecLive(); return; }
+      try { this.spawn(); } catch (err) { trace('встроенное: перезапуск не удался ' + err); }
+    };
+    try { r.start(); } catch (err) { trace('встроенное: start ' + err); }
+  },
+  stop() {
+    this.on = false;
+    if (!this.r) return Promise.resolve();
+    return new Promise((res) => {
+      this.endWait = res;
+      try { this.r.stop(); } catch { this.endWait = null; res(); return; }
+      setTimeout(() => { if (this.endWait) { this.endWait = null; if (this.cur) { this.done.push(this.cur); this.cur = ''; } res(); } }, 2000);
+    });
+  },
+  abort() { this.on = false; this.note = null; try { this.r?.abort(); } catch {} },
+};
 
 /* ================= Перераспознавание ================= */
 async function retranscribe(note) {
@@ -656,7 +731,9 @@ async function renderSettings() {
   app.innerHTML = `
   <header class="top"><div class="wrap row"><a class="iconbtn" href="#/">${I.back}</a><h1 class="grow" style="margin:0">Настройки</h1></div></header>
   <main class="wrap" style="padding-bottom:60px">
-    <div class="sec">Модель распознавания</div>
+    <div class="sec">Способ распознавания</div>${SR ? segBtn('engine', [['sys', IS_IOS ? 'Встроенное iPhone' : 'Встроенное браузера'], ['whisper', 'Whisper']]) : '<div class="small">В этом браузере встроенного распознавания нет — используется Whisper.</div>'}
+    <div class="small" style="margin-top:6px">Встроенное — то же, что диктовка Siri: работает сразу, без скачивания, хорошо понимает русский. Звук может обрабатываться на серверах Apple. Whisper — модель прямо на устройстве: на компьютере работает, на iPhone в Safari пока вылетает.</div>
+    <div class="sec">Модель Whisper</div>
     ${Object.entries(MODELS).map(([k, m]) => `<button class="opt ${S.model === k ? 'on' : ''}" data-model="${k}"><div><b>${m.name} <span class="small">${m.size}${ls.get('vn.dl.' + k, false) ? ' · скачана' : ''}</span></b><span class="small">${m.note}</span></div></button>`).join('')}
     <div class="status" data-asr>${asrStatusHTML()}</div>
     <div class="progress"><i id="dlprog"></i></div>
@@ -821,7 +898,7 @@ async function importJSON(e) {
   }
 
   render();
-  if (S.autoload && ls.get('vn.dl.' + S.model, false) && !crashNote) ASR.load();
+  if (!useSys() && S.autoload && ls.get('vn.dl.' + S.model, false) && !crashNote) ASR.load();
 })();
 addEventListener('pagehide', () => markAlive(false));
 document.addEventListener('visibilitychange', () => markAlive(!document.hidden));

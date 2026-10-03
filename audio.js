@@ -135,6 +135,16 @@ export class Recorder {
   }
 }
 
+// Заглушка без микрофона: только таймер (когда микрофон нужен встроенному распознаванию)
+export class NullRecorder {
+  constructor(offset = 0) { this.offset = offset; }
+  async start() { this.t0 = Date.now(); }
+  get level() { return 0; }
+  get seconds() { return this.offset + (this.t0 ? (Date.now() - this.t0) / 1000 : 0); }
+  takeNew() { return new Float32Array(0); }
+  async stop() { return new Float32Array(0); }
+}
+
 export function encodeWav(pcm, rate = 16000) {
   const b = new ArrayBuffer(44 + pcm.length * 2), v = new DataView(b);
   const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
