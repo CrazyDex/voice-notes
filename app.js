@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.7';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.8';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -17,7 +17,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.7';
+const VERSION = '0.8';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -25,6 +25,8 @@ if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model =
 if (IS_IOS && SR && !ls.get('vn.mig07', false)) { S.engine = 'sys'; ls.set('vn.mig07', true); saveS(); }
 if (!SR) S.engine = 'whisper';
 const useSys = () => S.engine === 'sys' && !!SR;
+// Whisper в Safari на iPhone падает во время распознавания — там его не предлагаем
+const RETRY_HINT = IS_IOS ? 'Аудио сохранено, его можно прослушать ниже.' : 'Нажмите «Перераспознать».';
 // На iPhone WebGPU-версия Whisper упирается в лимит памяти Safari — по умолчанию считаем на CPU
 function effDevice() { return S.device === 'auto' && IS_IOS ? 'wasm' : S.device; }
 // На iPhone многопоточный WebAssembly с общей памятью — частая причина вылетов Safari, поэтому там один поток
@@ -131,7 +133,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=0.7', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=0.8', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -559,9 +561,9 @@ function statusHTML(n) {
     return `<div class="warnbox">Распознаётся: ${j.done} из ${j.total}. Можно уйти с экрана, текст допишется сам, пока приложение открыто.
       <div class="progress"><i style="width:${(j.done / j.total) * 100}%"></i></div></div>`;
   }
-  if (n.recovered && n.status !== 'done') return `<div class="warnbox">Запись восстановлена после сбоя приложения (${fmtDur(n.duration)}). Нажмите «Перераспознать».</div>`;
-  if (n.status === 'transcribing' || n.status === 'recording') return `<div class="warnbox">Распознавание было прервано (приложение закрывалось). ${n.hasAudio ? 'Нажмите «Перераспознать».' : ''}</div>`;
-  if (n.status === 'error') return `<div class="warnbox">Часть записи не распознана. Нажмите «Перераспознать».</div>`;
+  if (n.recovered && n.status !== 'done') return `<div class="warnbox">Запись восстановлена после сбоя приложения (${fmtDur(n.duration)}). ${RETRY_HINT}</div>`;
+  if (n.status === 'transcribing' || n.status === 'recording') return `<div class="warnbox">Распознавание было прервано (приложение закрывалось). ${n.hasAudio ? RETRY_HINT : ''}</div>`;
+  if (n.status === 'error') return `<div class="warnbox">Часть записи не распознана. ${RETRY_HINT}</div>`;
   return '';
 }
 function renderNote(id) {
@@ -595,7 +597,7 @@ function renderNote(id) {
     <div class="sec">Аудио</div>
     <div id="naudio" class="small">${n.hasAudio ? 'Загрузка…' : 'Не сохранено'}</div>
     <div class="btns" style="margin-top:10px">
-      ${n.hasAudio ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
+      ${n.hasAudio && !IS_IOS ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
       <button class="btn danger" id="del">Удалить</button>
     </div>
   </main>`;
@@ -878,7 +880,8 @@ async function importJSON(e) {
   } else if (wasAlive) {
     crashNote = `Прошлый раз приложение закрылось аварийно. Последний шаг: «${lastStep || 'неизвестно'}». Журнал — в настройках, внизу.`;
   }
-  trace(`запуск v${VERSION}${IS_IOS ? ' · iOS' : ''} · изоляция: ${self.crossOriginIsolated ? 'да' : 'нет'}${wasAlive ? ' · после вылета' : ''}`);
+  trace(`запуск v${VERSION}${IS_IOS ? ' · iOS' : ''} · ${useSys() ? 'встроенное распознавание' : 'Whisper'} (в браузере ${SR ? 'есть' : 'нет'}) · изоляция: ${self.crossOriginIsolated ? 'да' : 'нет'}${wasAlive ? ' · после вылета' : ''}`);
+  if (IS_IOS && !useSys() && !crashNote) crashNote = SR ? 'Сейчас выбран Whisper — на iPhone он вылетает. Включите «Встроенное iPhone» в настройках.' : 'В этом режиме Safari нет встроенного распознавания речи, а Whisper на iPhone вылетает. Напишите разработчику.';
 
   // 2) Восстанавливаем записи, прерванные вылетом
   for (const n of notes) {
