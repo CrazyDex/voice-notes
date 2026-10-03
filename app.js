@@ -1,4 +1,4 @@
-import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.4';
+import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.5';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -15,7 +15,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.4';
+const VERSION = '0.5';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -27,16 +27,21 @@ function effThreads() { return !IS_IOS && self.crossOriginIsolated ? Math.max(1,
 /* ================= Журнал (виден после вылета) ================= */
 // Последние шаги пишутся в localStorage сразу: если вкладка упадёт, при следующем запуске видно, на чём именно
 const LOG_MAX = 40;
-function trace(text) {
+function trace(text, replaceSame) {
   try {
     const l = ls.get('vn.log', []);
     if (l.length && l[l.length - 1].slice(9) === text) return;
+    // пульс «жив» не копится, а обновляет последнюю строку
+    if (replaceSame && l.length && l[l.length - 1].slice(9).startsWith(replaceSame)) l.pop();
     l.push(new Date().toTimeString().slice(0, 8) + ' ' + text);
     ls.set('vn.log', l.slice(-LOG_MAX));
   } catch {}
 }
 // «Приложение живо и на экране». Если при запуске метка стоит — прошлый раз вкладка закрылась аварийно
 const markAlive = (v) => ls.set('vn.alive', v);
+// пульс раз в 3 с: по нему видно, сколько приложение прожило после последнего действия
+const T0 = Date.now();
+setInterval(() => { if (!document.hidden) trace(`жив ${Math.round((Date.now() - T0) / 1000)} с${rec ? ` · запись ${rec.seconds.toFixed(0)} с` : ''}${ASR.queue ? ' · в очереди ' + ASR.queue : ''}`, 'жив '); }, 3000);
 
 /* ================= База (IndexedDB) ================= */
 const dbp = new Promise((res, rej) => {
@@ -120,7 +125,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=0.4', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=0.5', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -255,15 +260,18 @@ async function startRecording() {
     tags: [], projectId: filter.project && filter.project !== 'none' ? filter.project : null, status: 'recording',
   };
   if (filter.tag) note.tags.push(filter.tag);
+  trace('запись: нажата кнопка');
   rec = new Recorder();
   segIndex = 0;
   try {
     await rec.start({
       segOpts: { minSec: 3, maxSec: S.segMax, silenceMs: 500 },
       onSegment: (a) => enqueue(note, a, segIndex++),
+      log: trace,
     });
   } catch (e) {
     rec = null;
+    trace('запись: ошибка ' + (e?.name || '') + ' ' + (e?.message || e));
     toast(e?.name === 'NotAllowedError' ? 'Нет доступа к микрофону. Разрешите его в настройках Safari.' : 'Микрофон недоступен: ' + (e?.message || e), 4500);
     return;
   }

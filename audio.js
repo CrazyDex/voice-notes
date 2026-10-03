@@ -83,23 +83,29 @@ process(inp){const c=inp[0]&&inp[0][0];if(c){for(let i=0;i<c.length;i++){this.b[
 registerProcessor('cap',Cap)`;
 
 export class Recorder {
-  async start({ onSegment, segOpts }) {
+  async start({ onSegment, segOpts, log = () => {} }) {
+    log('запись: запрос микрофона');
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    log('запись: микрофон получен');
     const AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC();
     await this.ctx.resume();
+    log(`запись: аудио ${this.ctx.sampleRate} Гц`);
     const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
     await this.ctx.audioWorklet.addModule(url);
     this.src = this.ctx.createMediaStreamSource(this.stream);
+    log('запись: обработчик звука загружен');
     this.node = new AudioWorkletNode(this.ctx, 'cap');
     const mute = this.ctx.createGain(); mute.gain.value = 0;
     this.src.connect(this.node); this.node.connect(mute); mute.connect(this.ctx.destination);
     this.rs = new Resampler(this.ctx.sampleRate, 16000);
     this.seg = new Segmenter(segOpts, onSegment);
     this.chunks = []; this.samples = 0;
+    let first = true;
     this.node.port.onmessage = (e) => {
+      if (first) { first = false; log('запись: звук идёт'); }
       const y = this.rs.process(e.data);
       this.chunks.push(y); this.samples += y.length;
       this.seg.push(y);
