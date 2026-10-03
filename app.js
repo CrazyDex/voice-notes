@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.9';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=1.0';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -17,7 +17,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.9';
+const VERSION = '1.0';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -119,6 +119,40 @@ function toast(msg, ms = 2600) {
   document.body.appendChild(t); setTimeout(() => t.remove(), ms);
 }
 
+/* ================= Обновление приложения ================= */
+// Номер свежей версии берём прямо из app.js на сайте, мимо всех кэшей
+async function latestVersion() {
+  try {
+    const t = await (await fetch('app.js?check=' + Date.now(), { cache: 'no-store' })).text();
+    return t.match(/const VERSION = '([\d.]+)'/)?.[1] || null;
+  } catch { return null; }
+}
+async function applyUpdate() {
+  if (rec) { toast('Сначала остановите запись'); return; }
+  toast('Обновляю…', 5000);
+  trace('обновление: с ' + VERSION);
+  try { const reg = await navigator.serviceWorker?.getRegistration(); await reg?.update(); } catch {}
+  try { for (const k of await caches.keys()) if (k.startsWith('vn-shell')) await caches.delete(k); } catch {}
+  location.reload();
+}
+let lastCheck = 0;
+async function checkUpdate(manual) {
+  if (!manual && Date.now() - lastCheck < 10 * 60 * 1000) return;
+  lastCheck = Date.now();
+  const v = await latestVersion();
+  if (v && v !== VERSION) {
+    if (manual) { applyUpdate(); return; }
+    if ($('#updbar')) return;
+    const b = document.createElement('div');
+    b.id = 'updbar'; b.className = 'toast';
+    b.style.cssText = 'top:calc(env(safe-area-inset-top) + 10px);bottom:auto;display:flex;gap:10px;align-items:center';
+    b.innerHTML = `<span>Есть новая версия ${esc(v)}</span><button class="btn" style="padding:6px 10px">Обновить</button><button aria-label="Закрыть" style="padding:4px 6px">✕</button>`;
+    const [upd, close] = b.querySelectorAll('button');
+    upd.onclick = applyUpdate; close.onclick = () => b.remove();
+    document.body.appendChild(b);
+  } else if (manual) toast(v ? `У вас последняя версия (${VERSION})` : 'Не удалось проверить — нет интернета?');
+}
+
 /* ================= Иконки ================= */
 const I = {
   mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>',
@@ -133,7 +167,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=0.9', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=1.0', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -788,6 +822,7 @@ async function renderSettings() {
     <div class="small">${usage} · заметок: ${notes.length}</div>
     <div class="btns" style="margin-top:8px"><button class="btn danger" id="clrm">Удалить скачанные модели</button></div>
     <div class="sec">Диагностика</div>
+    <div class="btns" style="margin-bottom:8px"><button class="btn" id="updchk">Проверить обновления</button></div>
     <div class="small" style="line-height:1.7">Версия ${VERSION} · ${IS_IOS ? 'iOS' : 'не iOS'} · многопоточность: ${self.crossOriginIsolated ? 'да (потоков ' + effThreads() + ')' : 'нет'} · WebGPU: ${navigator.gpu ? 'есть' : 'нет'} · режим: ${effDevice() === 'wasm' ? 'CPU' : effDevice()}${ASR.rtf ? ' · последняя скорость ×' + ASR.rtf.toFixed(2) : ''}</div>
     <details style="margin-top:8px"><summary class="small">Журнал последних действий</summary>
       <pre class="small" id="vlog" style="white-space:pre-wrap;user-select:text;margin:8px 0">${esc(ls.get('vn.log', []).join('\n') || 'пусто')}</pre>
@@ -810,6 +845,7 @@ async function renderSettings() {
     renderSettings();
   }));
   $('#loadm').onclick = () => ASR.load();
+  $('#updchk').onclick = () => checkUpdate(true);
   $('#cplog').onclick = async () => {
     const t = `v${VERSION} ${navigator.userAgent}\n` + ls.get('vn.log', []).join('\n');
     try { await navigator.clipboard.writeText(t); toast('Журнал скопирован'); } catch { toast('Не удалось скопировать — выделите текст вручную'); }
@@ -930,7 +966,8 @@ async function importJSON(e) {
   if (!useSys() && S.autoload && ls.get('vn.dl.' + S.model, false) && !crashNote) ASR.load();
 })();
 addEventListener('pagehide', () => markAlive(false));
-document.addEventListener('visibilitychange', () => markAlive(!document.hidden));
+document.addEventListener('visibilitychange', () => { markAlive(!document.hidden); if (!document.hidden) checkUpdate(false); });
+setTimeout(() => checkUpdate(false), 3000);
 // Предупреждение, если закрывают во время записи
 addEventListener('pagehide', () => { if (rec) stopRecording(); });
 document.addEventListener('visibilitychange', () => { if (document.hidden && rec) stopRecording(); });
