@@ -24,11 +24,12 @@ function dtypeFor(kind, device, f16) {
   if (kind === 'xenova') return 'q8';
   if (kind === 'onnx-q4') return { encoder_model: 'q4', decoder_model_merged: 'q4' };
   if (device === 'webgpu') return { encoder_model: f16 ? 'fp16' : 'fp32', decoder_model_merged: 'q4' };
+  // CPU: 8-битные веса — в 2–4 раза меньше памяти, чем fp16/fp32
   return { encoder_model: 'q8', decoder_model_merged: 'q8' };
 }
 
 let asr = null;
-let loaded = null; // {model, device}
+let loaded = null;
 let chain = Promise.resolve();
 
 async function webgpuInfo() {
@@ -40,44 +41,50 @@ async function webgpuInfo() {
   } catch { return null; }
 }
 
-async function load({ model, device }) {
-  if (loaded && loaded.model === model && (device === 'auto' || loaded.device === device)) {
-    postMessage({ type: 'ready', ...loaded, cached: true });
-    return;
-  }
+async function tryLoad(c, dev, gpu, threads, files) {
+  env.backends.onnx.wasm.numThreads = threads;
+  return pipeline('automatic-speech-recognition', c.id, {
+    device: dev,
+    dtype: dtypeFor(c.kind, dev, gpu?.f16),
+    progress_callback: (p) => {
+      if (p.status === 'progress' && p.total) {
+        files[p.file] = { loaded: p.loaded, total: p.total };
+        let l = 0; for (const f of Object.values(files)) l += f.loaded;
+        postMessage({ type: 'progress', loadedMB: l / 1e6, file: p.file.split('/').pop(), filePct: Math.round((p.loaded / p.total) * 100), fileMB: p.total / 1e6 });
+      }
+    },
+  });
+}
+
+async function load({ model, device, threads }) {
+  const key = model + '|' + device + '|' + threads;
+  if (loaded && loaded.key === key) { postMessage({ type: 'ready', ...loaded, cached: true }); return; }
   if (asr) { try { await asr.dispose(); } catch {} asr = null; loaded = null; }
 
-  const gpu = await webgpuInfo();
-  let devices = device === 'auto' ? (gpu ? ['webgpu', 'wasm'] : ['wasm']) : [device];
-  const files = {};
+  const gpu = device === 'wasm' ? null : await webgpuInfo();
+  const devices = device === 'auto' ? (gpu ? ['webgpu', 'wasm'] : ['wasm']) : [device];
   const errors = [];
   const t0 = performance.now();
 
   for (const dev of devices) {
     for (const c of CANDIDATES[model]) {
-      try {
-        postMessage({ type: 'status', text: `Загрузка ${c.id} (${dev})…` });
-        asr = await pipeline('automatic-speech-recognition', c.id, {
-          device: dev,
-          dtype: dtypeFor(c.kind, dev, gpu?.f16),
-          progress_callback: (p) => {
-            if (p.status === 'progress' && p.total) {
-              files[p.file] = { loaded: p.loaded, total: p.total };
-              let l = 0, t = 0;
-              for (const f of Object.values(files)) { l += f.loaded; t += f.total; }
-              postMessage({ type: 'progress', loaded: l, total: t });
-            }
-          },
-        });
-        // Прогрев: первый прогон компилирует шейдеры
-        postMessage({ type: 'status', text: 'Подготовка модели…' });
-        await asr(new Float32Array(16000), { language: 'russian', task: 'transcribe' });
-        loaded = { model, device: dev, repo: c.id };
-        postMessage({ type: 'ready', ...loaded, loadMs: Math.round(performance.now() - t0) });
-        return;
-      } catch (e) {
-        errors.push(`${c.id}/${dev}: ${e?.message || e}`);
-        if (asr) { try { await asr.dispose(); } catch {} asr = null; }
+      const threadOpts = dev === 'wasm' && threads > 1 ? [threads, 1] : [1];
+      for (const th of threadOpts) {
+        const files = {};
+        try {
+          postMessage({ type: 'status', text: `Загрузка ${c.id.split('/')[1]} (${dev === 'webgpu' ? 'WebGPU' : 'CPU×' + th})…`, stage: { dev, repo: c.id } });
+          asr = await tryLoad(c, dev, gpu, th, files);
+          if (dev === 'webgpu') {
+            postMessage({ type: 'status', text: 'Подготовка модели…' });
+            await asr(new Float32Array(16000), { language: 'russian', task: 'transcribe' });
+          }
+          loaded = { key, model, device: dev, repo: c.id, threads: dev === 'wasm' ? th : 0 };
+          postMessage({ type: 'ready', ...loaded, loadMs: Math.round(performance.now() - t0) });
+          return;
+        } catch (e) {
+          errors.push(`${c.id}/${dev}/${th}: ${e?.message || e}`);
+          if (asr) { try { await asr.dispose(); } catch {} asr = null; }
+        }
       }
     }
   }
@@ -102,8 +109,7 @@ async function run({ id, audio, language }) {
 
 self.onmessage = (e) => {
   const m = e.data;
-  // Строго по очереди: одна задача за раз
   if (m.type === 'load') chain = chain.then(() => load(m));
   else if (m.type === 'run') chain = chain.then(() => run(m));
 };
-postMessage({ type: 'boot' });
+postMessage({ type: 'boot', isolated: self.crossOriginIsolated === true });

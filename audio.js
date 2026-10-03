@@ -107,6 +107,15 @@ export class Recorder {
     this.t0 = Date.now();
   }
   get level() { return this.seg ? this.seg.level : 0; }
+  // новые сэмплы с прошлого вызова — для автосохранения записи кусками
+  takeNew() {
+    const from = this.taken || 0, arr = this.chunks.slice(from);
+    this.taken = this.chunks.length;
+    let n = 0; for (const c of arr) n += c.length;
+    const out = new Float32Array(n); let o = 0;
+    for (const c of arr) { out.set(c, o); o += c.length; }
+    return out;
+  }
   get seconds() { return this.samples / 16000; }
   async stop() {
     try { this.node.port.onmessage = null; this.src.disconnect(); this.node.disconnect(); } catch {}

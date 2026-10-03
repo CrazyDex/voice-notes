@@ -102,7 +102,13 @@ audio{width:100%;margin-top:6px}
 <div id="app"></div>
 <script type="module" src="app.js"></script>
 <script>
-if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Один раз перезагружаемся, чтобы страница получила заголовки изоляции от service worker (нужно для многопоточности)
+  const once = () => { try { if (!sessionStorage.getItem('vn.r')) { sessionStorage.setItem('vn.r', '1'); location.reload(); } } catch {} };
+  if (!self.crossOriginIsolated && navigator.serviceWorker.controller) once();
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (!self.crossOriginIsolated) once(); });
+}
 </script>
 </body>
 </html>

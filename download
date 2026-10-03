@@ -1,0 +1,7 @@
+# Для собственного хостинга на Apache: изоляция страницы (многопоточный WebAssembly) и верный тип манифеста
+<IfModule mod_headers.c>
+  Header set Cross-Origin-Opener-Policy "same-origin"
+  Header set Cross-Origin-Embedder-Policy "require-corp"
+</IfModule>
+AddType application/manifest+json .webmanifest
+AddType text/javascript .js

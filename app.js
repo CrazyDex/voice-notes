@@ -3,9 +3,9 @@ import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js';
 /* ================= Настройки ================= */
 const DEFAULTS = { model: 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true };
 const MODELS = {
-  base: { name: 'Base', size: '~80 МБ', note: 'Быстро, но больше ошибок. Для слабых устройств.' },
-  small: { name: 'Small', size: '~250 МБ', note: 'Баланс скорости и качества. Рекомендуется для iPhone.' },
-  medium: { name: 'Medium', size: '~800 МБ', note: 'Эксперимент: точнее, но медленно и может вылетать на телефоне по памяти.' },
+  base: { name: 'Base', size: '~80 МБ', note: 'Быстро и надёжно, но больше ошибок. Лучший вариант для «живого» текста на iPhone.' },
+  small: { name: 'Small', size: '~250 МБ', note: 'Точнее, но на iPhone заметно медленнее: текст может догонять уже после остановки.' },
+  medium: { name: 'Medium', size: '~800 МБ', note: 'Только для компьютера. На iPhone в браузере не хватает памяти.' },
 };
 const ls = {
   get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
@@ -13,6 +13,11 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
+const VERSION = '0.2';
+const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+// На iPhone WebGPU-версия Whisper упирается в лимит памяти Safari — по умолчанию считаем на CPU
+function effDevice() { return S.device === 'auto' && IS_IOS ? 'wasm' : S.device; }
+function effThreads() { return self.crossOriginIsolated ? Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)) : 1; }
 
 /* ================= База (IndexedDB) ================= */
 const dbp = new Promise((res, rej) => {
@@ -43,7 +48,7 @@ const DB = {
 };
 
 /* ================= Состояние ================= */
-let notes = [], projects = [];
+let notes = [], projects = [], crashNote = '';
 const filter = { project: null, tag: null, q: '' };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const $ = (s, r = document) => r.querySelector(s);
@@ -106,7 +111,9 @@ const ASR = {
     if (!this.w) return;
     this.state = 'loading'; this.progress = 0; this.msg = 'Запуск…';
     this.want = S.model + '|' + S.device;
-    this.w.postMessage({ type: 'load', model: S.model, device: S.device });
+    // Метка «идёт загрузка»: если приложение вылетит, при следующем запуске увидим её и откатимся на более лёгкий режим
+    ls.set('vn.loading', { model: S.model, device: effDevice(), t: Date.now() });
+    this.w.postMessage({ type: 'load', model: S.model, device: effDevice(), threads: effThreads() });
     asrUI();
   },
   ensure() {
@@ -124,14 +131,19 @@ const ASR = {
   },
   get queue() { return this.pending.size; },
   on(m) {
-    if (m.type === 'status') { this.msg = m.text; }
-    else if (m.type === 'progress') { this.progress = m.total ? m.loaded / m.total : 0; this.msg = `Скачивание модели ${Math.round(this.progress * 100)}% (${(m.loaded / 1e6).toFixed(0)} из ${(m.total / 1e6).toFixed(0)} МБ)`; }
+    if (m.type === 'boot') { this.isolated = m.isolated; }
+    else if (m.type === 'status') { this.msg = m.text; if (m.stage) { const g = ls.get('vn.loading', null); if (g) ls.set('vn.loading', { ...g, device: m.stage.dev }); } }
+    else if (m.type === 'progress') {
+      this.progress = m.filePct / 100;
+      this.msg = `Скачано ${m.loadedMB.toFixed(0)} МБ · файл ${m.file} (${m.fileMB.toFixed(0)} МБ): ${m.filePct}%`;
+    }
     else if (m.type === 'ready') {
       this.state = 'ready'; this.info = m; this.msg = '';
+      ls.set('vn.loading', null);
       ls.set('vn.dl.' + m.model, true);
       try { navigator.storage?.persist?.(); } catch {}
     }
-    else if (m.type === 'error') { this.state = 'error'; this.msg = m.text; }
+    else if (m.type === 'error') { this.state = 'error'; this.msg = m.text; ls.set('vn.loading', null); }
     else if (m.type === 'result') {
       const res = this.pending.get(m.id); this.pending.delete(m.id);
       if (m.ms && m.dur) { this.rtf = m.ms / 1000 / m.dur; ls.set('vn.rtf', this.rtf); }
@@ -144,7 +156,7 @@ const ASR = {
 function asrStatusHTML() {
   const name = MODELS[S.model].name;
   let cls = '', txt;
-  if (ASR.state === 'ready') { cls = 'ok'; txt = `${name} · ${ASR.info.device === 'webgpu' ? 'WebGPU' : 'CPU'} · готово`; }
+  if (ASR.state === 'ready') { cls = 'ok'; txt = `${name} · ${ASR.info.device === 'webgpu' ? 'WebGPU' : 'CPU×' + ASR.info.threads} · готово`; }
   else if (ASR.state === 'loading') { cls = 'warn'; txt = `${name}: ${ASR.msg || 'загрузка…'}`; }
   else if (ASR.state === 'error') { cls = 'err'; txt = 'Ошибка модели — открыть настройки'; }
   else txt = `${name} · загрузится при первой записи (${MODELS[S.model].size})`;
@@ -231,17 +243,31 @@ async function startRecording() {
     return;
   }
   recNote = note;
+  note.parts = 0;
   notes.unshift(note);
   saveNote(note);
-  ASR.ensure();
   try { wake = await navigator.wakeLock?.request('screen'); } catch {}
   renderRec();
   recTimer = setInterval(updateRec, 100);
+  // Автосохранение звука каждые 5 с: если приложение вылетит, запись не пропадёт
+  const r = rec;
+  recSaver = setInterval(async () => {
+    if (rec !== r) return;
+    const pcm = r.takeNew();
+    if (!pcm.length) return;
+    const k = note.parts++;
+    note.duration = r.seconds;
+    await DB.put('audio', encodeWav(pcm), note.id + ':p' + k);
+    saveNote(note);
+  }, 5000);
+  // модель грузим чуть позже, чтобы запись точно успела стартовать
+  setTimeout(() => ASR.ensure(), 300);
 }
+let recSaver = null;
 
 async function stopRecording() {
   if (!rec) return;
-  clearInterval(recTimer);
+  clearInterval(recTimer); clearInterval(recSaver);
   const r = rec; rec = null;
   const pcm = await r.stop();
   const note = recNote; recNote = null;
@@ -249,6 +275,8 @@ async function stopRecording() {
   wake = null;
   note.duration = pcm.length / 16000;
   if (S.keepAudio && pcm.length) { await DB.put('audio', encodeWav(pcm), note.id); note.hasAudio = true; }
+  for (let i = 0; i < (note.parts || 0); i++) await DB.del('audio', note.id + ':p' + i);
+  note.parts = 0;
   note.status = jobs.has(note.id) ? 'transcribing' : 'done';
   finishIfDone(note);
   saveNote(note);
@@ -347,10 +375,11 @@ function renderHome() {
     <div class="chips" id="pchips"></div>
     <div class="status" data-asr>${asrStatusHTML()}</div>
   </div></header>
-  <main class="wrap"><div class="list" id="list"></div></main>
+  <main class="wrap">${crashNote ? `<div class="warnbox" id="crash">${esc(crashNote)} <a href="#/settings">Настройки</a> · <a id="crashok">Понятно</a></div>` : ''}<div class="list" id="list"></div></main>
   <button class="fab" id="fab" aria-label="Записать">${I.mic}</button>`;
   $('#q').oninput = (e) => { filter.q = e.target.value; renderList(); };
   $('#fab').onclick = startRecording;
+  const ok = $('#crashok'); if (ok) ok.onclick = () => { crashNote = ''; $('#crash').remove(); };
   renderChips(); renderList();
 }
 function renderChips() {
@@ -418,6 +447,7 @@ function statusHTML(n) {
     return `<div class="warnbox">Распознаётся: ${j.done} из ${j.total}. Можно уйти с экрана, текст допишется сам, пока приложение открыто.
       <div class="progress"><i style="width:${(j.done / j.total) * 100}%"></i></div></div>`;
   }
+  if (n.recovered && n.status !== 'done') return `<div class="warnbox">Запись восстановлена после сбоя приложения (${fmtDur(n.duration)}). Нажмите «Перераспознать».</div>`;
   if (n.status === 'transcribing' || n.status === 'recording') return `<div class="warnbox">Распознавание было прервано (приложение закрывалось). ${n.hasAudio ? 'Нажмите «Перераспознать».' : ''}</div>`;
   if (n.status === 'error') return `<div class="warnbox">Часть записи не распознана. Нажмите «Перераспознать».</div>`;
   return '';
@@ -598,9 +628,9 @@ async function renderSettings() {
 
     <div class="sec">Язык речи</div>${segBtn('lang', [['ru', 'Русский'], ['en', 'English'], ['auto', 'Авто']])}
     <div class="sec">Вычисления</div>${segBtn('device', [['auto', 'Авто'], ['webgpu', 'WebGPU'], ['wasm', 'CPU']])}
-    <div class="small" style="margin-top:6px">WebGPU — видеочип, обычно в разы быстрее. CPU — запасной вариант.</div>
-    <div class="sec">Максимальная длина куска</div>${segBtn('segMax', [[8, '8 с'], [12, '12 с'], [20, '20 с']])}
-    <div class="small" style="margin-top:6px">Запись режется по паузам. Короче — текст появляется быстрее, длиннее — точнее контекст.</div>
+    <div class="small" style="margin-top:6px">WebGPU — видеочип, быстрее, но требует больше памяти. На iPhone «Авто» = CPU: WebGPU-версия модели вылетает по памяти Safari.</div>
+    <div class="sec">Максимальная длина куска</div>${segBtn('segMax', [[8, '8 с'], [12, '12 с'], [20, '20 с'], [28, '28 с']])}
+    <div class="small" style="margin-top:6px">Запись режется по паузам. Whisper тратит почти одинаковое время на кусок любой длины до 30 с, поэтому на медленном устройстве длинные куски (20–28 с) выгоднее: меньше кусков — меньше общее время.</div>
     <div class="sec">Прочее</div>
     ${segBtn('autoload', [[true, 'Грузить модель при запуске'], [false, 'Только при записи']])}
     <div style="height:8px"></div>${segBtn('keepAudio', [[true, 'Хранить аудио'], [false, 'Только текст']])}
@@ -615,12 +645,14 @@ async function renderSettings() {
     <div class="sec">Хранилище</div>
     <div class="small">${usage} · заметок: ${notes.length}</div>
     <div class="btns" style="margin-top:8px"><button class="btn danger" id="clrm">Удалить скачанные модели</button></div>
+    <div class="sec">Диагностика</div>
+    <div class="small" style="line-height:1.7">Версия ${VERSION} · ${IS_IOS ? 'iOS' : 'не iOS'} · многопоточность: ${self.crossOriginIsolated ? 'да (потоков ' + effThreads() + ')' : 'нет'} · WebGPU: ${navigator.gpu ? 'есть' : 'нет'} · режим: ${effDevice() === 'wasm' ? 'CPU' : effDevice()}${ASR.rtf ? ' · последняя скорость ×' + ASR.rtf.toFixed(2) : ''}</div>
     <div class="small" style="margin-top:24px">Всё хранится только на этом устройстве. Распознавание идёт локально, интернет нужен только для первой загрузки модели.</div>
   </main>`;
   asrUI();
   app.querySelectorAll('[data-model]').forEach((b) => (b.onclick = () => {
     S.model = b.dataset.model; saveS();
-    if (S.model === 'medium') toast('Medium на телефоне — эксперимент: может работать медленно или закрыть приложение', 4500);
+    if (S.model === 'medium' && IS_IOS) toast('Medium на iPhone почти наверняка закроет приложение из-за памяти', 4500);
     if (ASR.state === 'ready' || ASR.state === 'loading' || ls.get('vn.dl.' + S.model, false)) ASR.load();
     renderSettings();
   }));
@@ -646,7 +678,7 @@ async function renderSettings() {
 
 /* ================= Экспорт ================= */
 function loadScript(src) {
-  return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
+  return new Promise((res, rej) => { const s = document.createElement('script'); s.crossOrigin = 'anonymous'; s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
 }
 async function deliver(blob, filename) {
   const file = new File([blob], filename, { type: blob.type });
@@ -699,8 +731,38 @@ async function importJSON(e) {
 (async function boot() {
   [notes, projects] = await Promise.all([DB.all('notes'), DB.all('projects')]);
   projects.sort((a, b) => a.createdAt - b.createdAt);
+
+  // 1) Прошлый запуск вылетел во время загрузки модели → переходим на более лёгкий режим
+  const crashed = ls.get('vn.loading', null);
+  if (crashed) {
+    ls.set('vn.loading', null);
+    const was = `${MODELS[crashed.model]?.name || crashed.model} (${crashed.device === 'webgpu' ? 'WebGPU' : 'CPU'})`;
+    if (crashed.device === 'webgpu' || (crashed.device === 'auto' && !IS_IOS)) { S.device = 'wasm'; }
+    else if (crashed.model === 'medium') { S.model = 'small'; }
+    else if (crashed.model === 'small') { S.model = 'base'; }
+    saveS();
+    crashNote = `Прошлый раз приложение закрылось при загрузке модели ${was} — скорее всего, не хватило памяти. Переключил на ${MODELS[S.model].name} (${effDevice() === 'webgpu' ? 'WebGPU' : 'CPU'}).`;
+  }
+
+  // 2) Восстанавливаем записи, прерванные вылетом
+  for (const n of notes) {
+    if (n.status !== 'recording') continue;
+    if (n.parts > 0) {
+      const pieces = [];
+      for (let i = 0; i < n.parts; i++) { const b = await DB.get('audio', n.id + ':p' + i); if (b) pieces.push(await decodeWav(b)); }
+      const len = pieces.reduce((s, p) => s + p.length, 0);
+      const all = new Float32Array(len); let o = 0;
+      for (const p of pieces) { all.set(p, o); o += p.length; }
+      if (len) { await DB.put('audio', encodeWav(all), n.id); n.hasAudio = true; n.duration = len / 16000; }
+      for (let i = 0; i < n.parts; i++) await DB.del('audio', n.id + ':p' + i);
+      n.parts = 0;
+    }
+    n.recovered = true; n.status = 'error';
+    await DB.put('notes', n);
+  }
+
   render();
-  if (S.autoload && ls.get('vn.dl.' + S.model, false)) ASR.load();
+  if (S.autoload && ls.get('vn.dl.' + S.model, false) && !crashed) ASR.load();
 })();
 // Предупреждение, если закрывают во время записи
 addEventListener('pagehide', () => { if (rec) stopRecording(); });
