@@ -1,4 +1,4 @@
-import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js';
+import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.3';
 
 /* ================= Настройки ================= */
 const DEFAULTS = { model: 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true };
@@ -13,7 +13,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.2';
+const VERSION = '0.3';
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 // На iPhone WebGPU-версия Whisper упирается в лимит памяти Safari — по умолчанию считаем на CPU
 function effDevice() { return S.device === 'auto' && IS_IOS ? 'wasm' : S.device; }
@@ -101,7 +101,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=0.3', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }

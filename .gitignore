@@ -1,0 +1,6 @@
+# секреты и мусор — не коммитить
+github-token.txt
+*.token
+.env
+Thumbs.db
+desktop.ini
