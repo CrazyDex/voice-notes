@@ -1,13 +1,15 @@
 // Офлайн-кэш + заголовки COOP/COEP (включают многопоточность WebAssembly — распознавание на CPU в 2–3 раза быстрее).
 // Модели кэширует сама transformers.js.
-const SHELL = 'vn-shell-v3', CDN = 'vn-cdn-v1';
+const SHELL = 'vn-shell-v4', CDN = 'vn-cdn-v1';
 const FILES = ['./', 'index.html', 'app.js', 'audio.js', 'asr-worker.js', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(SHELL).then((c) => c.addAll(FILES)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k.startsWith('vn-') && k !== SHELL && k !== CDN).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
 });
+// На iPhone изоляцию не включаем: многопоточный WebAssembly с общей памятью там часто роняет Safari
+const IOS = /iPhone|iPad|iPod/.test(self.navigator.userAgent);
 function isolate(r) {
-  if (!r || r.status === 0 || r.type === 'opaque') return r;
+  if (IOS || !r || r.status === 0 || r.type === 'opaque') return r;
   const h = new Headers(r.headers);
   h.set('Cross-Origin-Opener-Policy', 'same-origin');
   h.set('Cross-Origin-Embedder-Policy', 'require-corp');

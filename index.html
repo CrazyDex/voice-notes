@@ -100,14 +100,16 @@ audio{width:100%;margin-top:6px}
 </head>
 <body>
 <div id="app"></div>
-<script type="module" src="app.js?v=0.3"></script>
+<script type="module" src="app.js?v=0.4"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
   // Один раз перезагружаемся, чтобы страница получила заголовки изоляции от service worker (нужно для многопоточности)
   const once = () => { try { if (!sessionStorage.getItem('vn.r')) { sessionStorage.setItem('vn.r', '1'); location.reload(); } } catch {} };
-  if (!self.crossOriginIsolated && navigator.serviceWorker.controller) once();
-  navigator.serviceWorker.addEventListener('controllerchange', () => { if (!self.crossOriginIsolated) once(); });
+  // На iPhone изоляция выключена (см. sw.js) — перезагружаться незачем
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (!ios && !self.crossOriginIsolated && navigator.serviceWorker.controller) once();
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (!ios && !self.crossOriginIsolated) once(); });
 }
 </script>
 </body>

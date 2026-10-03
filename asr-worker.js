@@ -6,6 +6,10 @@ env.allowLocalModels = false;
 env.useBrowserCache = true;
 
 const CANDIDATES = {
+  tiny: [
+    { id: 'onnx-community/whisper-tiny', kind: 'onnx' },
+    { id: 'Xenova/whisper-tiny', kind: 'xenova' },
+  ],
   base: [
     { id: 'onnx-community/whisper-base', kind: 'onnx' },
     { id: 'Xenova/whisper-base', kind: 'xenova' },

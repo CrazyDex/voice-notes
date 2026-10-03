@@ -1,8 +1,10 @@
-import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.3';
+import { Recorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=0.4';
 
 /* ================= Настройки ================= */
-const DEFAULTS = { model: 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true };
+const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const DEFAULTS = { model: IS_IOS ? 'base' : 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true };
 const MODELS = {
+  tiny: { name: 'Tiny', size: '~45 МБ', note: 'Самая лёгкая. Много ошибок, но почти наверняка не вылетит — для проверки, что всё работает.' },
   base: { name: 'Base', size: '~80 МБ', note: 'Быстро и надёжно, но больше ошибок. Лучший вариант для «живого» текста на iPhone.' },
   small: { name: 'Small', size: '~250 МБ', note: 'Точнее, но на iPhone заметно медленнее: текст может догонять уже после остановки.' },
   medium: { name: 'Medium', size: '~800 МБ', note: 'Только для компьютера. На iPhone в браузере не хватает памяти.' },
@@ -13,11 +15,28 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '0.3';
-const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const VERSION = '0.4';
+if (!MODELS[S.model]) S.model = DEFAULTS.model;
+// v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
+if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
 // На iPhone WebGPU-версия Whisper упирается в лимит памяти Safari — по умолчанию считаем на CPU
 function effDevice() { return S.device === 'auto' && IS_IOS ? 'wasm' : S.device; }
-function effThreads() { return self.crossOriginIsolated ? Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)) : 1; }
+// На iPhone многопоточный WebAssembly с общей памятью — частая причина вылетов Safari, поэтому там один поток
+function effThreads() { return !IS_IOS && self.crossOriginIsolated ? Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)) : 1; }
+
+/* ================= Журнал (виден после вылета) ================= */
+// Последние шаги пишутся в localStorage сразу: если вкладка упадёт, при следующем запуске видно, на чём именно
+const LOG_MAX = 40;
+function trace(text) {
+  try {
+    const l = ls.get('vn.log', []);
+    if (l.length && l[l.length - 1].slice(9) === text) return;
+    l.push(new Date().toTimeString().slice(0, 8) + ' ' + text);
+    ls.set('vn.log', l.slice(-LOG_MAX));
+  } catch {}
+}
+// «Приложение живо и на экране». Если при запуске метка стоит — прошлый раз вкладка закрылась аварийно
+const markAlive = (v) => ls.set('vn.alive', v);
 
 /* ================= База (IndexedDB) ================= */
 const dbp = new Promise((res, rej) => {
@@ -101,7 +120,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=0.3', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=0.4', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -113,6 +132,7 @@ const ASR = {
     this.want = S.model + '|' + S.device;
     // Метка «идёт загрузка»: если приложение вылетит, при следующем запуске увидим её и откатимся на более лёгкий режим
     ls.set('vn.loading', { model: S.model, device: effDevice(), t: Date.now() });
+    trace(`модель: загрузка ${S.model} / ${effDevice() === 'wasm' ? 'CPU×' + effThreads() : effDevice()}`);
     this.w.postMessage({ type: 'load', model: S.model, device: effDevice(), threads: effThreads() });
     asrUI();
   },
@@ -126,26 +146,31 @@ const ASR = {
     const id = ++this.seq;
     return new Promise((res) => {
       this.pending.set(id, res);
+      trace(`распознавание: кусок ${(audio.length / 16000).toFixed(1)} с`);
       this.w.postMessage({ type: 'run', id, audio, language: S.lang }, [audio.buffer]);
     });
   },
   get queue() { return this.pending.size; },
   on(m) {
     if (m.type === 'boot') { this.isolated = m.isolated; }
-    else if (m.type === 'status') { this.msg = m.text; if (m.stage) { const g = ls.get('vn.loading', null); if (g) ls.set('vn.loading', { ...g, device: m.stage.dev }); } }
+    else if (m.type === 'status') { this.msg = m.text; trace('модель: ' + m.text); if (m.stage) { const g = ls.get('vn.loading', null); if (g) ls.set('vn.loading', { ...g, device: m.stage.dev }); } }
     else if (m.type === 'progress') {
+      if (m.filePct === 100) trace(`скачан ${m.file} (${m.fileMB.toFixed(0)} МБ)`);
       this.progress = m.filePct / 100;
       this.msg = `Скачано ${m.loadedMB.toFixed(0)} МБ · файл ${m.file} (${m.fileMB.toFixed(0)} МБ): ${m.filePct}%`;
     }
     else if (m.type === 'ready') {
       this.state = 'ready'; this.info = m; this.msg = '';
+      trace(`модель готова: ${m.repo} (${m.device}${m.threads ? '×' + m.threads : ''})`);
       ls.set('vn.loading', null);
+      ls.set('vn.safe', false);
       ls.set('vn.dl.' + m.model, true);
       try { navigator.storage?.persist?.(); } catch {}
     }
-    else if (m.type === 'error') { this.state = 'error'; this.msg = m.text; ls.set('vn.loading', null); }
+    else if (m.type === 'error') { this.state = 'error'; this.msg = m.text; trace('ошибка модели: ' + m.text.slice(0, 200)); ls.set('vn.loading', null); }
     else if (m.type === 'result') {
       const res = this.pending.get(m.id); this.pending.delete(m.id);
+      trace(m.error ? 'распознавание: ошибка ' + m.error : `распознано за ${(m.ms / 1000).toFixed(1)} с`);
       if (m.ms && m.dur) { this.rtf = m.ms / 1000 / m.dur; ls.set('vn.rtf', this.rtf); }
       res && res(m);
     }
@@ -243,6 +268,7 @@ async function startRecording() {
     return;
   }
   recNote = note;
+  trace('запись: старт');
   note.parts = 0;
   notes.unshift(note);
   saveNote(note);
@@ -261,7 +287,7 @@ async function startRecording() {
     saveNote(note);
   }, 5000);
   // модель грузим чуть позже, чтобы запись точно успела стартовать
-  setTimeout(() => ASR.ensure(), 300);
+  if (!ls.get('vn.safe', false)) setTimeout(() => ASR.ensure(), 300);
 }
 let recSaver = null;
 
@@ -269,6 +295,7 @@ async function stopRecording() {
   if (!rec) return;
   clearInterval(recTimer); clearInterval(recSaver);
   const r = rec; rec = null;
+  trace('запись: стоп');
   const pcm = await r.stop();
   const note = recNote; recNote = null;
   try { await wake?.release(); } catch {}
@@ -647,6 +674,10 @@ async function renderSettings() {
     <div class="btns" style="margin-top:8px"><button class="btn danger" id="clrm">Удалить скачанные модели</button></div>
     <div class="sec">Диагностика</div>
     <div class="small" style="line-height:1.7">Версия ${VERSION} · ${IS_IOS ? 'iOS' : 'не iOS'} · многопоточность: ${self.crossOriginIsolated ? 'да (потоков ' + effThreads() + ')' : 'нет'} · WebGPU: ${navigator.gpu ? 'есть' : 'нет'} · режим: ${effDevice() === 'wasm' ? 'CPU' : effDevice()}${ASR.rtf ? ' · последняя скорость ×' + ASR.rtf.toFixed(2) : ''}</div>
+    <details style="margin-top:8px"><summary class="small">Журнал последних действий</summary>
+      <pre class="small" id="vlog" style="white-space:pre-wrap;user-select:text;margin:8px 0">${esc(ls.get('vn.log', []).join('\n') || 'пусто')}</pre>
+      <button class="btn" id="cplog">Скопировать журнал</button>
+    </details>
     <div class="small" style="margin-top:24px">Всё хранится только на этом устройстве. Распознавание идёт локально, интернет нужен только для первой загрузки модели.</div>
   </main>`;
   asrUI();
@@ -664,6 +695,10 @@ async function renderSettings() {
     renderSettings();
   }));
   $('#loadm').onclick = () => ASR.load();
+  $('#cplog').onclick = async () => {
+    const t = `v${VERSION} ${navigator.userAgent}\n` + ls.get('vn.log', []).join('\n');
+    try { await navigator.clipboard.writeText(t); toast('Журнал скопирован'); } catch { toast('Не удалось скопировать — выделите текст вручную'); }
+  };
   $('#exmd').onclick = () => exportMarkdown(false);
   $('#exmda').onclick = () => exportMarkdown(true);
   $('#exjs').onclick = exportJSON;
@@ -732,17 +767,31 @@ async function importJSON(e) {
   [notes, projects] = await Promise.all([DB.all('notes'), DB.all('projects')]);
   projects.sort((a, b) => a.createdAt - b.createdAt);
 
-  // 1) Прошлый запуск вылетел во время загрузки модели → переходим на более лёгкий режим
-  const crashed = ls.get('vn.loading', null);
-  if (crashed) {
+  // 1) Прошлый запуск закрылся аварийно → смотрим журнал и переходим на более лёгкий режим
+  const wasAlive = ls.get('vn.alive', false);
+  // метка загрузки считается вылетом, только если приложение было на экране (а не свёрнуто посреди загрузки)
+  const crashed = wasAlive ? ls.get('vn.loading', null) : null;
+  ls.set('vn.loading', null);
+  const lastStep = ls.get('vn.log', []).slice(-1)[0] || '';
+  const inAsr = /распознавание: кусок/.test(lastStep);
+  markAlive(true);
+  if (crashed || (wasAlive && inAsr)) {
     ls.set('vn.loading', null);
-    const was = `${MODELS[crashed.model]?.name || crashed.model} (${crashed.device === 'webgpu' ? 'WebGPU' : 'CPU'})`;
-    if (crashed.device === 'webgpu' || (crashed.device === 'auto' && !IS_IOS)) { S.device = 'wasm'; }
-    else if (crashed.model === 'medium') { S.model = 'small'; }
-    else if (crashed.model === 'small') { S.model = 'base'; }
+    const dev = crashed ? crashed.device : effDevice();
+    const model = crashed ? crashed.model : S.model;
+    const was = `${MODELS[model]?.name || model} (${dev === 'webgpu' ? 'WebGPU' : 'CPU'})`;
+    if (dev === 'webgpu' || (dev === 'auto' && !IS_IOS)) { S.device = 'wasm'; }
+    else if (model === 'medium') { S.model = 'small'; }
+    else if (model === 'small') { S.model = 'base'; }
+    else if (model === 'base') { S.model = 'tiny'; }
+    // модель больше не грузится сама во время записи: звук сохраняется, распознать можно потом вручную
+    ls.set('vn.safe', true);
     saveS();
-    crashNote = `Прошлый раз приложение закрылось при загрузке модели ${was} — скорее всего, не хватило памяти. Переключил на ${MODELS[S.model].name} (${effDevice() === 'webgpu' ? 'WebGPU' : 'CPU'}).`;
+    crashNote = `Прошлый раз приложение закрылось ${crashed ? 'при загрузке' : 'во время работы'} модели ${was} — скорее всего, не хватило памяти. Переключил на ${MODELS[S.model].name} (${effDevice() === 'webgpu' ? 'WebGPU' : 'CPU'}). Модель теперь загружается только кнопкой в настройках.`;
+  } else if (wasAlive) {
+    crashNote = `Прошлый раз приложение закрылось аварийно. Последний шаг: «${lastStep || 'неизвестно'}». Журнал — в настройках, внизу.`;
   }
+  trace(`запуск v${VERSION}${IS_IOS ? ' · iOS' : ''} · изоляция: ${self.crossOriginIsolated ? 'да' : 'нет'}${wasAlive ? ' · после вылета' : ''}`);
 
   // 2) Восстанавливаем записи, прерванные вылетом
   for (const n of notes) {
@@ -762,8 +811,10 @@ async function importJSON(e) {
   }
 
   render();
-  if (S.autoload && ls.get('vn.dl.' + S.model, false) && !crashed) ASR.load();
+  if (S.autoload && ls.get('vn.dl.' + S.model, false) && !crashNote) ASR.load();
 })();
+addEventListener('pagehide', () => markAlive(false));
+document.addEventListener('visibilitychange', () => markAlive(!document.hidden));
 // Предупреждение, если закрывают во время записи
 addEventListener('pagehide', () => { if (rec) stopRecording(); });
 document.addEventListener('visibilitychange', () => { if (document.hidden && rec) stopRecording(); });
