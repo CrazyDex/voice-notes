@@ -30,14 +30,39 @@ if not exist "%PY%" (
 
 echo.
 echo  2/4  Ставлю faster-whisper и библиотеки видеокарты (около 1,5 ГБ, несколько минут)...
-"%PY%" -m pip install --upgrade pip >nul
-"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
-if errorlevel 1 (
-  echo  Ошибка установки библиотек. Сделайте снимок экрана и пришлите в чат.
-  pause
-  exit /b 1
+if not exist "%APPDATA%\voice-notes-agent" mkdir "%APPDATA%\voice-notes-agent"
+del "%APPDATA%\voice-notes-agent\proxy.json" 2>nul
+rem Системный прокси Windows старый pip понимает неправильно — передаём его явно как http://
+set "VNPROXY="
+for /f "usebackq delims=" %%P in (`call "%PY%" "%~dp0proxy_fix.py"`) do set "VNPROXY=%%P"
+if defined VNPROXY (
+  echo  В Windows включён прокси %VNPROXY% — подключаюсь через него.
+  set "HTTP_PROXY=%VNPROXY%"
+  set "HTTPS_PROXY=%VNPROXY%"
 )
+"%PY%" -m pip install --upgrade pip
+"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+if not errorlevel 1 goto pip_ok
+if not defined VNPROXY goto pip_fail
+echo.
+echo  Через прокси не получилось. Пробую напрямую, без прокси...
+set "HTTP_PROXY="
+set "HTTPS_PROXY="
+set "NO_PROXY=*"
+"%PY%" -m pip install --upgrade pip
+"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+if not errorlevel 1 (
+  echo {"proxy": "off"}> "%APPDATA%\voice-notes-agent\proxy.json"
+  goto pip_ok
+)
+:pip_fail
+echo.
+echo  Ошибка установки библиотек. Сделайте снимок экрана последних строк и пришлите в чат.
+pause
+exit /b 1
+:pip_ok
 copy /y "%~dp0vn_agent.py" "%DIR%\vn_agent.py" >nul
+copy /y "%~dp0proxy_fix.py" "%DIR%\proxy_fix.py" >nul
 
 echo.
 echo  3/4  Ключ Яндекс Диска и проверка модели

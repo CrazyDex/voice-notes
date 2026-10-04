@@ -19,7 +19,19 @@ import tempfile
 import time
 import traceback
 
-import requests
+import proxy_fix
+
+# прокси Windows: переписываем https://адрес → http://адрес (иначе старый Python падает),
+# а если установщик выяснил, что через прокси не работает, — ходим напрямую
+_HOME = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'voice-notes-agent')
+try:
+    with open(os.path.join(_HOME, 'proxy.json'), encoding='utf-8') as _f:
+        _DIRECT = json.load(_f).get('proxy') == 'off'
+except Exception:
+    _DIRECT = False
+proxy_fix.fix(direct=_DIRECT)
+
+import requests  # noqa: E402  (после настройки прокси)
 
 AGENT_VERSION = '1.0'
 API = os.environ.get('VN_YD_API', 'https://cloud-api.yandex.net/v1/disk')
@@ -318,6 +330,10 @@ class Agent:
                 else:
                     log.info('Яндекс Диск: %s', e)
                     delay = min(300, delay * 2)
+            except requests.exceptions.ProxyError as e:
+                log.info('Прокси не отвечает (%s) — дальше хожу напрямую', e.__class__.__name__)
+                proxy_fix.fix(direct=True)
+                delay = 10
             except requests.RequestException as e:
                 log.info('Нет связи: %s', e.__class__.__name__)  # компьютер только проснулся / нет интернета
                 delay = min(300, delay * 2)
