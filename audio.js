@@ -22,7 +22,7 @@ export class Segmenter {
     this.left = new Float32Array(0);
     this.frames = []; this.en = []; this.sp = [];
     this.nf = null; this.silRun = 0; this.offset = 0; // offset — номер первого кадра буфера
-    this.level = 0;
+    this.level = 0; this.voiced = 0; // voiced — сколько кадров с речью (для проверки, слышит ли распознавание)
   }
   push(x) {
     let buf = x;
@@ -41,6 +41,7 @@ export class Segmenter {
     this.nf = Math.max(this.nf, 0.0008);
     const speech = rms > Math.max(this.nf * 3, 0.006);
     this.frames.push(f); this.en.push(rms); this.sp.push(speech ? 1 : 0);
+    if (speech) this.voiced++;
     this.silRun = speech ? 0 : this.silRun + 1;
 
     const hasSpeech = this.speechCount() > 0;
@@ -134,6 +135,7 @@ export class Recorder {
     this.t0 = Date.now();
   }
   get level() { return this.seg ? this.seg.level : 0; }
+  get voicedSec() { return this.seg ? this.seg.voiced / 50 : 0; }
   // новые сэмплы с прошлого вызова — для автосохранения записи кусками
   takeNew() {
     const from = this.taken || 0, arr = this.chunks.slice(from);
@@ -161,6 +163,7 @@ export class NullRecorder {
   constructor(offset = 0) { this.offset = offset; }
   async start() { this.t0 = Date.now(); }
   get level() { return 0; }
+  get voicedSec() { return 0; }
   get seconds() { return this.offset + (this.t0 ? (Date.now() - this.t0) / 1000 : 0); }
   takeNew() { return new Float32Array(0); }
   async stop() { return new Float32Array(0); }

@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.6';
+import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.7';
 import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.5';
 
 /* ================= Настройки ================= */
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.6';
+const VERSION = '1.7';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -610,8 +610,28 @@ const Sys = {
   r: null, on: false, done: [], cur: '', note: null, err: '', quick: 0, endWait: null,
   texts() { return [...this.done.map((t) => punctuate(t, true)), punctuate(this.cur, false)].filter(Boolean); },
   start(note) {
-    this.note = note; this.on = true; this.done = []; this.cur = ''; this.err = ''; this.quick = 0;
+    this.note = note; this.on = true; this.done = []; this.cur = ''; this.err = ''; this.quick = 0; this.revives = 0;
     this.spawn();
+    // Сторож: иногда Safari запускает распознавание, но оно не получает звук (в журнале «слушаю», текста нет,
+    // при стопе «No speech detected»), хотя наш микрофон речь слышит. Тогда перезапускаем сессию,
+    // а если не помогло — отдаём микрофон распознаванию (дальше только текст, без звука для ПК).
+    clearInterval(this.dog);
+    this.dog = setInterval(() => {
+      if (!this.on || !this.r || this.heard || !rec) return;
+      const age = (Date.now() - this.t0) / 1000, voiced = rec.voicedSec - this.v0;
+      if (age < 4 || voiced < 1.5) return;
+      if (++this.revives <= 2) {
+        trace(`встроенное: не слышит (речь ${voiced.toFixed(1)} с), перезапуск ${this.revives}`);
+        try { this.r.abort(); } catch {}
+        return;
+      }
+      if (!(rec instanceof NullRecorder)) {
+        trace('встроенное: всё ещё не слышит — отдаю микрофон распознаванию, звук дальше не пишется');
+        const old = rec; rec = new NullRecorder(old.seconds); rec.start(); old.stop().catch(() => {}).finally(() => releaseMic(true));
+        try { this.r.abort(); } catch {}
+      }
+      clearInterval(this.dog);
+    }, 1000);
   },
   spawn() {
     const r = new SR();
@@ -620,8 +640,12 @@ const Sys = {
     r.continuous = true;
     r.interimResults = true;
     const t0 = Date.now();
+    this.t0 = t0; this.heard = false; this.v0 = rec ? rec.voicedSec : 0;
     r.onstart = () => trace('встроенное: слушаю');
+    r.onaudiostart = () => trace('встроенное: звук пошёл');
+    r.onspeechstart = () => { this.heard = true; trace('встроенное: слышу речь'); };
     r.onresult = (e) => {
+      if (!this.heard) { this.heard = true; trace('встроенное: первый текст'); }
       let t = '';
       for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript + ' ';
       this.cur = t.replace(/\s+/g, ' ').trim();
@@ -651,7 +675,7 @@ const Sys = {
     try { r.start(); } catch (err) { trace('встроенное: start ' + err); }
   },
   stop() {
-    this.on = false;
+    this.on = false; clearInterval(this.dog);
     if (!this.r) return Promise.resolve();
     return new Promise((res) => {
       this.endWait = res;
@@ -659,7 +683,7 @@ const Sys = {
       setTimeout(() => { if (this.endWait) { this.endWait = null; if (this.cur) { this.done.push(this.cur); this.cur = ''; } res(); } }, 2000);
     });
   },
-  abort() { this.on = false; this.note = null; try { this.r?.abort(); } catch {} },
+  abort() { this.on = false; this.note = null; clearInterval(this.dog); try { this.r?.abort(); } catch {} },
 };
 
 /* ================= Перераспознавание ================= */
