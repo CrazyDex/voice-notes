@@ -171,3 +171,54 @@ export function segmentAll(pcm, segOpts) {
   s.flush();
   return segs;
 }
+
+// Аудиофайл (голосовое из Telegram .ogg/.oga/.opus, .m4a, .mp3, .wav…) → моно 16 кГц.
+// Сначала пробуем встроенный декодер браузера; Ogg Opus, который браузер не понимает, разбираем своим (WebAssembly).
+export async function decodeAudioFile(file, log = () => {}) {
+  const buf = await file.arrayBuffer();
+  const head = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+  const isOgg = String.fromCharCode(...head) === 'OggS';
+  try {
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const ctx = new OAC(1, 1, 16000);
+    // decodeAudioData сам приводит частоту к частоте контекста (16 кГц)
+    const ab = await new Promise((res, rej) => { const p = ctx.decodeAudioData(buf.slice(0), res, rej); if (p?.then) p.then(res, rej); });
+    log(`файл: декодирован браузером (${ab.numberOfChannels} кан., ${ab.sampleRate} Гц, ${ab.duration.toFixed(1)} с)`);
+    return toMono16k([...Array(ab.numberOfChannels)].map((_, i) => ab.getChannelData(i)), ab.sampleRate);
+  } catch (e) {
+    log('файл: браузер не декодировал' + (isOgg ? ', пробую декодер Opus' : '') + ' — ' + (e?.message || e?.name || e));
+    if (!isOgg) throw new Error('формат не поддерживается');
+  }
+  const lib = await loadOpusDecoder();
+  const dec = new lib.OggOpusDecoder();
+  await dec.ready;
+  try {
+    const { channelData, sampleRate, samplesDecoded } = await dec.decodeFile(new Uint8Array(buf));
+    if (!samplesDecoded) throw new Error('в файле нет звука Opus');
+    log(`файл: декодирован Opus (${channelData.length} кан., ${sampleRate} Гц, ${(samplesDecoded / sampleRate).toFixed(1)} с)`);
+    return toMono16k(channelData, sampleRate);
+  } finally { dec.free(); }
+}
+
+function toMono16k(chs, rate) {
+  let mono = chs[0];
+  if (chs.length > 1) {
+    mono = new Float32Array(chs[0].length);
+    for (const c of chs) for (let i = 0; i < mono.length; i++) mono[i] += c[i] / chs.length;
+  }
+  if (Math.abs(rate - 16000) < 1) return mono;
+  const out = new Resampler(rate, 16000).process(mono);
+  return out.slice(0);
+}
+
+let opusLib = null;
+function loadOpusDecoder() {
+  if (window['ogg-opus-decoder']) return Promise.resolve(window['ogg-opus-decoder']);
+  return (opusLib ||= new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = new URL('vendor/ogg-opus-decoder.min.js', import.meta.url).href;
+    s.onload = () => (window['ogg-opus-decoder'] ? res(window['ogg-opus-decoder']) : rej(new Error('декодер Opus не загрузился')));
+    s.onerror = () => { opusLib = null; rej(new Error('декодер Opus не загрузился (нужен интернет один раз)')); };
+    document.head.appendChild(s);
+  }));
+}

@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll } from './audio.js?v=1.0';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.1';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -17,7 +17,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.0';
+const VERSION = '1.1';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -158,6 +158,7 @@ const I = {
   mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>',
   gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
   back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>',
+  file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 18v-6M9 15l3 3 3-3"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
 };
 
@@ -167,7 +168,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=1.0', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=1.1', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -520,6 +521,49 @@ async function retranscribe(note) {
   onNoteChanged(note);
 }
 
+/* ================= Импорт аудиофайлов (голосовые из Telegram и т. п.) ================= */
+// Распознать файл можно только Whisper'ом: встроенное распознавание слушает лишь микрофон,
+// а Whisper в Safari на iPhone вылетает — там файл просто сохраняется с аудио.
+const canTranscribeFile = () => !IS_IOS;
+async function importAudio(files) {
+  files = [...(files || [])];
+  if (!files.length) return;
+  if (rec) { toast('Сначала остановите запись'); return; }
+  let added = 0, last = null;
+  for (const f of files) {
+    toast(`Читаю ${f.name}…`, 2000);
+    trace(`импорт: ${f.name} (${(f.size / 1e6).toFixed(1)} МБ, ${f.type || 'тип неизвестен'})`);
+    let pcm;
+    try { pcm = await decodeAudioFile(f, trace); }
+    catch (e) { trace('импорт: ошибка ' + (e?.message || e)); toast(`Не удалось открыть ${f.name}: ${e?.message || e}`, 5000); continue; }
+    if (!pcm.length) { toast(`В файле ${f.name} нет звука`); continue; }
+    const note = {
+      id: uid(), createdAt: Date.now(), updatedAt: Date.now(), title: '', text: '', segTexts: [],
+      tags: filter.tag ? [filter.tag] : [], projectId: filter.project && filter.project !== 'none' ? filter.project : null,
+      status: 'done', source: 'file', fileName: f.name, duration: pcm.length / 16000, hasAudio: true,
+    };
+    await DB.put('audio', encodeWav(pcm), note.id);
+    notes.unshift(note);
+    if (canTranscribeFile()) {
+      const segs = segmentAll(pcm, { minSec: 3, maxSec: S.segMax, silenceMs: 500 });
+      segs.forEach((s, i) => enqueue(note, s.a, i));
+      if (!segs.length) toast('В файле не найдено речи');
+    }
+    saveNote(note);
+    added++; last = note;
+  }
+  if (added === 1) location.hash = '#/n/' + last.id;
+  else if (added) { toast(`Добавлено заметок: ${added}`); render(); }
+}
+function pickAudioFiles() {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.multiple = true;
+  // на iPhone .ogg/.oga не всегда считаются «аудио» и становятся серыми в «Файлах» — там тип не ограничиваем
+  if (!IS_IOS) inp.accept = 'audio/*,.ogg,.oga,.opus,.m4a,.mp3,.wav,.webm';
+  inp.onchange = () => importAudio(inp.files);
+  inp.click();
+}
+
 /* ================= Роутинг ================= */
 function route() {
   const h = location.hash.slice(1);
@@ -543,6 +587,7 @@ function renderHome() {
   app.innerHTML = `
   <header class="top"><div class="wrap">
     <div class="row"><h1 class="grow">Заметки</h1>
+      <button class="iconbtn" id="impbtn" aria-label="Добавить аудиофайл" title="Добавить голосовое из файла (Telegram)">${I.file}</button>
       <a class="iconbtn" href="#/projects" aria-label="Проекты">${I.folder}</a>
       <a class="iconbtn" href="#/settings" aria-label="Настройки">${I.gear}</a></div>
     <input class="search" id="q" type="search" placeholder="Поиск по тексту, #меткам, [[связям]]" value="${esc(filter.q)}">
@@ -553,6 +598,7 @@ function renderHome() {
   <button class="fab" id="fab" aria-label="Записать">${I.mic}</button>`;
   $('#q').oninput = (e) => { filter.q = e.target.value; renderList(); };
   $('#fab').onclick = startRecording;
+  $('#impbtn').onclick = pickAudioFiles;
   const ok = $('#crashok'); if (ok) ok.onclick = () => { crashNote = ''; $('#crash').remove(); };
   renderChips(); renderList();
 }
@@ -597,7 +643,7 @@ function renderList() {
     return `<a class="card" href="#/n/${encodeURIComponent(n.id)}">
       <div class="t">${esc(titleOf(n))}</div>
       <div class="s">${esc((n.text || '').slice(0, 220)) || '<i>без текста</i>'}</div>
-      <div class="meta"><span>${fmtDate(n.createdAt)}</span>${n.duration ? `<span>${fmtDur(n.duration)}</span>` : ''}
+      <div class="meta"><span>${fmtDate(n.createdAt)}</span>${n.source === 'file' ? '<span>📎 файл</span>' : ''}${n.duration ? `<span>${fmtDur(n.duration)}</span>` : ''}
         ${n.projectId ? `<span class="badge">${esc(projName(n.projectId) || '?')}</span>` : ''}
         ${tagsOf(n).slice(0, 4).map((t) => `<span class="tg">#${esc(t)}</span>`).join('')}
         ${links ? `<span>🔗 ${links}</span>` : ''}${st}</div></a>`;
@@ -624,6 +670,7 @@ function statusHTML(n) {
   if (n.recovered && n.status !== 'done') return `<div class="warnbox">Запись восстановлена после сбоя приложения (${fmtDur(n.duration)}). ${RETRY_HINT}</div>`;
   if (n.status === 'transcribing' || n.status === 'recording') return `<div class="warnbox">Распознавание было прервано (приложение закрывалось). ${n.hasAudio ? RETRY_HINT : ''}</div>`;
   if (n.status === 'error') return `<div class="warnbox">Часть записи не распознана. ${RETRY_HINT}</div>`;
+  if (n.source === 'file' && !n.text && IS_IOS) return `<div class="warnbox">Голосовое добавлено из файла, аудио ниже. Распознать файл на iPhone пока нельзя: встроенное распознавание Apple слушает только микрофон, а Whisper в Safari вылетает. Текст можно вписать в «Правке».</div>`;
   return '';
 }
 function renderNote(id) {
@@ -636,7 +683,7 @@ function renderNote(id) {
   app.innerHTML = `
   <header class="top"><div class="wrap row">
     <a class="iconbtn" href="#/" aria-label="Назад">${I.back}</a>
-    <div class="grow small">${fmtDate(n.createdAt)}${n.duration ? ' · ' + fmtDur(n.duration) : ''}</div>
+    <div class="grow small">${fmtDate(n.createdAt)}${n.duration ? ' · ' + fmtDur(n.duration) : ''}${n.fileName ? ' · 📎 ' + esc(n.fileName) : ''}</div>
     <div class="seg" style="width:170px"><button data-m="0" class="${!editMode ? 'on' : ''}">Просмотр</button><button data-m="1" class="${editMode ? 'on' : ''}">Правка</button></div>
   </div></header>
   <main class="wrap" style="padding-bottom:60px">
