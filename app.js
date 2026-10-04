@@ -1,5 +1,5 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.3';
-import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.3';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.4';
+import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.4';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.3';
+const VERSION = '1.4';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -93,7 +93,7 @@ const LINK_RE = /\[\[([^\[\]\n]{1,120})\]\]/g;
 
 function titleOf(n) {
   if (n.title?.trim()) return n.title.trim();
-  const t = (n.text || '').replace(LINK_RE, '$1').replace(/\s+/g, ' ').trim();
+  const t = (n.text || '').replace(LINK_RE, (_, x) => linkParts(x).label).replace(/\s+/g, ' ').trim();
   if (t) { const w = t.split(' ').slice(0, 7).join(' '); return w.length < t.length ? w + '…' : w; }
   return 'Заметка ' + fmtDate(n.createdAt);
 }
@@ -102,7 +102,96 @@ function tagsOf(n) {
   for (const m of (n.text || '').matchAll(TAG_RE)) set.add(m[2].toLowerCase());
   return [...set];
 }
-function linksOf(n) { return [...(n.text || '').matchAll(LINK_RE)].map((m) => m[1].trim()); }
+// [[Заметка|текст]] — ссылка на «Заметку», а в тексте видно «текст» (как в Obsidian)
+function linkParts(x) { const i = x.indexOf('|'); return i < 0 ? { target: x.trim(), label: x.trim() } : { target: x.slice(0, i).trim(), label: x.slice(i + 1).trim() || x.slice(0, i).trim() }; }
+function linksOf(n) { return [...(n.text || '').matchAll(LINK_RE)].map((m) => linkParts(m[1]).target); }
+
+/* ---- Подсказки меток и связей: простое сравнение слов, без моделей ---- */
+const STOP = new Set('и в во на не что как это об о обо для по из за от до у к ко с со же ли бы то а но или да нет его ее её их мы вы они он она оно я ты мне меня нам вас там тут так уже еще ещё все всё very the and for with this that'.split(' '));
+const END_RE = /(иями|ями|ами|ого|его|ому|ему|ыми|ими|ая|яя|ое|ее|ые|ие|ый|ий|ой|ую|юю|ов|ев|ей|ах|ях|ам|ям|ом|ем|ию|ия|ии|ть|ся|сь|а|я|о|е|ы|и|у|ю|ь|й)$/;
+function stem(w) {
+  w = w.toLowerCase().replace(/ё/g, 'е');
+  if (w.length <= 3) return w;
+  const r = w.replace(END_RE, '');
+  return r.length >= 3 ? r : w;
+}
+const sameStem = (a, b) => a === b || (Math.min(a.length, b.length) >= 4 && Math.abs(a.length - b.length) <= 2 && (a.startsWith(b) || b.startsWith(a)));
+const WORD_RE = /[\p{L}\p{N}]+/gu;
+// значимые слова с позициями; пропускаем то, что уже внутри [[ссылок]] и #меток
+function wordsOf(text) {
+  const skip = [];
+  for (const m of text.matchAll(LINK_RE)) skip.push([m.index, m.index + m[0].length]);
+  for (const m of text.matchAll(TAG_RE)) skip.push([m.index, m.index + m[0].length]);
+  const out = [];
+  for (const m of text.matchAll(WORD_RE)) {
+    const w = m[0], i = m.index;
+    if (skip.some(([a, b]) => i >= a && i < b)) continue;
+    out.push({ w, s: stem(w), i, e: i + w.length, stop: w.length < 3 || STOP.has(w.toLowerCase()) });
+  }
+  return out;
+}
+const keyWords = (s) => [...s.replace(/[_\-/]/g, ' ').matchAll(WORD_RE)].map((m) => m[0]).filter((w) => w.length >= 3 && !STOP.has(w.toLowerCase())).map(stem);
+// ищет в тексте подряд идущие слова, похожие на keys (между ними допускаются короткие служебные слова)
+function findRun(words, keys) {
+  for (let k = 0; k < words.length; k++) {
+    if (words[k].stop || !sameStem(words[k].s, keys[0])) continue;
+    let j = k, ki = 1;
+    while (ki < keys.length) {
+      let t = j + 1;
+      while (t < words.length && words[t].stop && t - j <= 2) t++;
+      if (t < words.length && !words[t].stop && sameStem(words[t].s, keys[ki])) { j = t; ki++; } else break;
+    }
+    if (ki === keys.length) return { a: words[k].i, b: words[j].e };
+  }
+  return null;
+}
+function suggestFor(n) {
+  const text = n.text || '';
+  if (!text.trim()) return [];
+  const words = wordsOf(text), sig = words.filter((w) => !w.stop);
+  if (!sig.length) return [];
+  const hidden = new Set(n.sugHidden || []), out = [];
+  const has = new Set(tagsOf(n));
+  const counts = {};
+  notes.forEach((o) => { if (o.id !== n.id) tagsOf(o).forEach((t) => (counts[t] = (counts[t] || 0) + 1)); });
+  for (const [t, c] of Object.entries(counts)) {
+    if (has.has(t) || hidden.has('#' + t)) continue;
+    const keys = keyWords(t); if (!keys.length) continue;
+    const hit = keys.every((k) => sig.some((w) => sameStem(w.s, k)));
+    if (hit) out.push({ kind: 'tag', key: '#' + t, tag: t, score: keys.length * 10 + c });
+  }
+  const linked = new Set(linksOf(n).map((l) => l.toLowerCase()));
+  for (const o of notes) {
+    if (o.id === n.id || !o.title?.trim()) continue;
+    const title = o.title.trim();
+    if (linked.has(title.toLowerCase()) || hidden.has('[[' + title.toLowerCase())) continue;
+    const keys = keyWords(title); if (!keys.length || keys.length > 6) continue;
+    const run = findRun(words, keys);
+    if (run) { out.push({ kind: 'link', key: '[[' + title.toLowerCase(), title, run, score: keys.length * 10 + 5 }); continue; }
+    // слова названия встречаются не подряд — тоже подсказываем, если их хватает
+    const found = keys.filter((k) => sig.some((w) => sameStem(w.s, k))).length;
+    if (keys.length >= 2 && found === keys.length) out.push({ kind: 'link', key: '[[' + title.toLowerCase(), title, run: null, score: keys.length * 5 });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, 8);
+}
+function applySuggestion(n, g) {
+  if (g.kind === 'tag') { if (!(n.tags || []).includes(g.tag)) n.tags = [...(n.tags || []), g.tag]; return; }
+  const text = n.text || '';
+  if (g.run) {
+    const frag = text.slice(g.run.a, g.run.b);
+    const link = frag.toLowerCase() === g.title.toLowerCase() ? `[[${g.title}]]` : `[[${g.title}|${frag}]]`;
+    n.text = text.slice(0, g.run.a) + link + text.slice(g.run.b);
+  } else n.text = text.replace(/\s*$/, '') + ` [[${g.title}]]`;
+  n.segTexts = null; n.prefix = '';
+}
+function sugHTML(n) {
+  const list = suggestFor(n);
+  if (!list.length) return '';
+  return `<div class="sec">Подсказки</div><div class="chips" style="flex-wrap:wrap">${list.map((g, i) => g.kind === 'tag'
+    ? `<button class="chip tag" data-sug="${i}">+ #${esc(g.tag)}</button>`
+    : `<button class="chip" data-sug="${i}">+ 🔗 ${esc(g.title)}</button>`).join('')}<button class="chip" data-sughide style="color:var(--muted)">Скрыть</button></div>`;
+}
+
 function findByTitle(t) { const k = t.trim().toLowerCase(); return notes.find((n) => titleOf(n).toLowerCase() === k || (n.title || '').trim().toLowerCase() === k); }
 function fmtDate(ts) { return new Date(ts).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); }
 function fmtDur(s) { s = Math.round(s || 0); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
@@ -169,7 +258,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=1.3', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=1.4', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -817,9 +906,10 @@ function renderList() {
 let editMode = false, lastNoteId = null;
 function renderedText(n) {
   let h = esc(n.text || '');
-  h = h.replace(/\[\[([^\[\]\n]{1,120})\]\]/g, (_, t) => {
+  h = h.replace(/\[\[([^\[\]\n]{1,120})\]\]/g, (_, x) => {
+    const { target: t, label } = linkParts(x);
     const target = findByTitle(t.replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"'));
-    return `<a class="lk ${target ? '' : 'missing'}" data-link="${t}">${t}</a>`;
+    return `<a class="lk ${target ? '' : 'missing'}" data-link="${t}">${label}</a>`;
   });
   h = h.replace(/(^|[\s(,.;:!?])#([\p{L}\p{N}_\-/]+)/gu, (_, p, t) => `${p}<a class="tg" data-tag="${t.toLowerCase()}">#${t}</a>`);
   return h || '<span class="small">Текста пока нет</span>';
@@ -862,6 +952,7 @@ function renderNote(id) {
       <div class="btns" style="margin:8px 0"><button class="btn" id="inslink">[[ ]] Связать</button><button class="btn" id="instag"># Метка</button></div>
       <textarea class="field" id="ntext" placeholder="Текст заметки. #метки и [[ссылки на другие заметки]] работают прямо в тексте.">${esc(n.text || '')}</textarea>`
       : `<div class="rendered" id="ntextv">${renderedText(n)}</div>`}
+    <div id="nsug">${busy ? '' : sugHTML(n)}</div>
     ${outgoing.length ? `<div class="sec">Связи из заметки</div><div class="chips" style="flex-wrap:wrap">${outgoing.map((l) => `<button class="chip" data-link="${esc(l)}">🔗 ${esc(l)}</button>`).join('')}</div>` : ''}
     <div class="sec">Ссылаются сюда</div>
     ${backlinks.length ? backlinks.map((b) => `<a class="card" href="#/n/${encodeURIComponent(b.id)}" style="margin-bottom:6px"><div class="t">${esc(titleOf(b))}</div><div class="meta">${fmtDate(b.createdAt)}</div></a>`).join('') : '<div class="small">Пока никто. Напишите [[' + esc(titleOf(n)) + ']] в другой заметке.</div>'}
@@ -882,9 +973,26 @@ function renderNote(id) {
   $('#ntitle').oninput = (e) => { n.title = e.target.value; saveNote(n, 500); };
   const ta = $('#ntext');
   if (ta) {
-    ta.oninput = () => { n.text = ta.value; n.segTexts = null; n.prefix = ''; saveNote(n, 500); };
-    $('#inslink').onclick = () => pickNote(n.id, (title) => insertAt(ta, `[[${title}]]`));
-    $('#instag').onclick = () => { const t = prompt('Метка (без #):'); if (t) insertAt(ta, '#' + t.trim().replace(/\s+/g, '_') + ' '); };
+    let sugT;
+    ta.oninput = () => {
+      n.text = ta.value; n.segTexts = null; n.prefix = ''; saveNote(n, 500);
+      clearTimeout(sugT); sugT = setTimeout(() => bindSug(n), 800);
+    };
+    // выделенный текст остаётся в заметке как есть: [[Заметка|выделенное]]
+    $('#inslink').onclick = () => {
+      const a = ta.selectionStart, b = ta.selectionEnd, sel = ta.value.slice(a, b).trim();
+      pickNote(n.id, (title) => {
+        ta.selectionStart = a; ta.selectionEnd = b;
+        insertAt(ta, sel && sel.toLowerCase() !== title.toLowerCase() ? `[[${title}|${sel}]]` : `[[${title}]]`);
+      }, sel);
+    };
+    // с выделением метка добавляется после него, слово не пропадает
+    $('#instag').onclick = () => {
+      const a = ta.selectionStart, b = ta.selectionEnd, sel = ta.value.slice(a, b).trim();
+      const t = prompt('Метка (без #):', sel.replace(/\s+/g, '_').toLowerCase()); if (!t?.trim()) return;
+      ta.selectionStart = ta.selectionEnd = b;
+      insertAt(ta, '#' + t.trim().replace(/^#/, '').replace(/\s+/g, '_') + ' ');
+    };
   }
   $('#nproj').onclick = () => pickProject(n.projectId, (pid) => { n.projectId = pid; saveNote(n); renderNote(id); });
   $('#addtag').onclick = () => {
@@ -894,6 +1002,7 @@ function renderNote(id) {
   };
   app.querySelectorAll('[data-rmtag]').forEach((b) => (b.onclick = () => { n.tags = n.tags.filter((t) => t !== b.dataset.rmtag); saveNote(n); renderNote(id); }));
   bindTextLinks(app);
+  bindSug(n, false);
   const rt = $('#retr'); if (rt) rt.onclick = () => retranscribe(n);
   const tp = $('#topc'); if (tp) tp.onclick = () => sendToPC(n);
   bindPCBox(n); bindVersions(n);
@@ -908,6 +1017,21 @@ function renderNote(id) {
     if (!blob) { box.textContent = 'Не найдено'; return; }
     box.innerHTML = `<audio controls preload="metadata" src="${URL.createObjectURL(blob)}"></audio><div>${(blob.size / 1e6).toFixed(1)} МБ</div>`;
   });
+}
+function bindSug(n, redraw = true) {
+  const box = $('#nsug'); if (!box) return;
+  if (redraw) box.innerHTML = sugHTML(n);
+  const list = suggestFor(n);
+  box.querySelectorAll('[data-sug]').forEach((b) => (b.onclick = () => {
+    const g = list[+b.dataset.sug]; if (!g) return;
+    const ta = $('#ntext');
+    if (ta) n.text = ta.value;
+    applySuggestion(n, g); saveNote(n);
+    const keep = scrollY; renderNote(n.id); scrollTo(0, keep);
+    toast(g.kind === 'tag' ? `Добавлена метка #${g.tag}` : `Связано с «${g.title}»`);
+  }));
+  const h = box.querySelector('[data-sughide]');
+  if (h) h.onclick = () => { n.sugHidden = [...new Set([...(n.sugHidden || []), ...list.map((g) => g.key)])]; saveNote(n); box.innerHTML = ''; };
 }
 function bindTextLinks(root) {
   root.querySelectorAll('[data-link]').forEach((a) => (a.onclick = () => openLink(a.dataset.link)));
@@ -951,11 +1075,12 @@ function pickProject(current, cb) {
     $('#newp', el).onclick = async () => { const p = await createProject(); if (p) { close(); cb(p.id); } };
   });
 }
-function pickNote(selfId, cb) {
-  sheet(`<input class="search" id="pq" placeholder="Найти заметку или ввести новое название"><div id="pl" style="margin-top:8px"></div>`, (el, close) => {
+function pickNote(selfId, cb, q0 = '') {
+  sheet(`<input class="search" id="pq" placeholder="Найти заметку или ввести новое название" value="${esc(q0)}"><div id="pl" style="margin-top:8px"></div>`, (el, close) => {
     const draw = () => {
       const q = $('#pq', el).value.trim().toLowerCase();
-      const list = notes.filter((n) => n.id !== selfId && titleOf(n).toLowerCase().includes(q)).slice(0, 30);
+      const qk = keyWords(q);
+      const list = notes.filter((n) => n.id !== selfId && (titleOf(n).toLowerCase().includes(q) || (qk.length && qk.every((k) => keyWords(titleOf(n)).some((t) => sameStem(t, k)))))).slice(0, 30);
       $('#pl', el).innerHTML = list.map((n) => `<button class="item" data-t="${esc(titleOf(n).replace(/…$/, ''))}">${esc(titleOf(n))}<div class="small">${fmtDate(n.createdAt)}</div></button>`).join('')
         + (q ? `<button class="item" data-t="${esc($('#pq', el).value.trim())}" style="color:var(--link)">+ Ссылка на новую «${esc($('#pq', el).value.trim())}»</button>` : '');
       el.querySelectorAll('[data-t]').forEach((b) => (b.onclick = () => {
