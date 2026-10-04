@@ -1,5 +1,5 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.4';
-import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.4';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.5';
+import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.5';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.4';
+const VERSION = '1.5';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -93,7 +93,7 @@ const LINK_RE = /\[\[([^\[\]\n]{1,120})\]\]/g;
 
 function titleOf(n) {
   if (n.title?.trim()) return n.title.trim();
-  const t = (n.text || '').replace(LINK_RE, (_, x) => linkParts(x).label).replace(/\s+/g, ' ').trim();
+  const t = (n.text || '').replace(/^#{1,6} .*$/gm, '').replace(LINK_RE, (_, x) => linkParts(x).label).replace(/\s+/g, ' ').trim();
   if (t) { const w = t.split(' ').slice(0, 7).join(' '); return w.length < t.length ? w + '…' : w; }
   return 'Заметка ' + fmtDate(n.createdAt);
 }
@@ -258,7 +258,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=1.4', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=1.5', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -364,7 +364,7 @@ function enqueue(note, audio, index) {
   });
 }
 function joinSegs(n) {
-  const head = n.prefix ? n.prefix + ' ' : '';
+  const head = n.prefix ? (n.prefix.endsWith('\n') ? n.prefix : n.prefix + ' ') : '';
   return (head + (n.segTexts || []).filter(Boolean).join(' ')).trim();
 }
 function finishIfDone(note) {
@@ -376,6 +376,35 @@ function finishIfDone(note) {
     if (j.failed) toast('Часть записи не распознана — можно перераспознать');
   }
 }
+
+/* ================= Журнал: дозапись голосом в существующую заметку ================= */
+// Текст заметки — главное. Каждая новая запись не перезаписывает его, а добавляет в конец раздел
+// «### 🎙 4 октября 2026, 11:40» со своим текстом; аудио записи хранится отдельно (note.clips),
+// его можно прослушать и отдельно отправить на компьютер. В экспорте под заголовком — ![[аудио]].
+// clip = { id, at, head, duration, hasAudio, pc, pcText }
+const clipKey = (n, c) => n.id + '--' + c.id;
+function clipHead(n, ts) {
+  const d = new Date(ts);
+  const base = '### 🎙 ' + d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '') + ', ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  let h = base, k = 2;
+  while ((n.text || '').includes(h) || (n.clips || []).some((c) => c.head === h)) h = `${base} (${k++})`;
+  return h;
+}
+// где в тексте раздел этой записи: от её заголовка до заголовка следующей записи (или до конца)
+function clipRange(n, c) {
+  const t = n.text || '';
+  const h = c.head ? t.indexOf(c.head) : -1;
+  if (h < 0) return null;
+  const a = h + c.head.length;
+  let b = t.length;
+  for (const o of n.clips || []) { if (o === c || !o.head) continue; const i = t.indexOf(o.head, a); if (i >= 0 && i < b) b = i; }
+  return { a, b, body: t.slice(a, b).trim() };
+}
+function setClipBody(n, r, body) {
+  const t = n.text || '', rest = t.slice(r.b);
+  setText(n, t.slice(0, r.a) + '\n' + body.trim() + (rest ? '\n\n' + rest : ''));
+}
+const clipTime = (c) => new Date(c.at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
 /* ================= Запись ================= */
 let rec = null, recNote = null, recTimer = null, wake = null, segIndex = 0;
@@ -390,15 +419,34 @@ function recInfo() {
   return parts.join(' · ');
 }
 
-async function startRecording() {
+// target — существующая заметка: запись дописывается в неё новым разделом (журнал), а не создаёт новую
+async function startRecording(target) {
   if (rec) return;
-  const note = {
-    id: uid(), createdAt: Date.now(), updatedAt: Date.now(), title: '', text: '', segTexts: [],
-    tags: [], projectId: filter.project && filter.project !== 'none' ? filter.project : null, status: 'recording',
-  };
-  if (filter.tag) note.tags.push(filter.tag);
+  let note, clip = null, undo = null;
+  if (target && target.id) {
+    if (jobs.has(target.id) || target.status === 'transcribing' || target.status === 'recording') { toast('Дождитесь окончания распознавания'); return; }
+    note = target;
+    undo = { text: note.text, segTexts: note.segTexts, prefix: note.prefix, status: note.status };
+    clip = { id: uid(), at: Date.now() };
+    clip.head = clipHead(note, clip.at);
+    const base = (note.text || '').replace(/\s+$/, '');
+    // прежний текст — неизменная «шапка», новый текст пишется после заголовка раздела
+    note.prefix = (base ? base + '\n\n' : '') + clip.head + '\n';
+    note.segTexts = [];
+    note.clips = [...(note.clips || []), clip];
+    note.recClip = clip.id;
+    note.status = 'recording';
+    note.text = joinSegs(note);
+  } else {
+    note = {
+      id: uid(), createdAt: Date.now(), updatedAt: Date.now(), title: '', text: '', segTexts: [],
+      tags: [], projectId: filter.project && filter.project !== 'none' ? filter.project : null, status: 'recording',
+    };
+    if (filter.tag) note.tags.push(filter.tag);
+  }
+  const recKey = clip ? clipKey(note, clip) : note.id;
   const sys = useSys();
-  trace('запись: нажата кнопка' + (sys ? ' (встроенное распознавание)' : ''));
+  trace('запись: нажата кнопка' + (sys ? ' (встроенное распознавание)' : '') + (clip ? ' · дозапись в заметку' : ''));
   // если встроенное распознавание не уживается с нашей записью звука — пишем только текст
   rec = sys && ls.get('vn.sysNoRec', false) ? new NullRecorder() : new Recorder();
   segIndex = 0;
@@ -412,6 +460,7 @@ async function startRecording() {
   } catch (e) {
     rec = null;
     if (sys) Sys.abort();
+    if (clip) { Object.assign(note, undo); note.clips = note.clips.filter((c) => c !== clip); delete note.recClip; }
     trace('запись: ошибка ' + (e?.name || '') + ' ' + (e?.message || e));
     toast(e?.name === 'NotAllowedError' ? 'Нет доступа к микрофону. Разрешите его в настройках Safari.' : 'Микрофон недоступен: ' + (e?.message || e), 4500);
     return;
@@ -419,7 +468,7 @@ async function startRecording() {
   recNote = note;
   trace('запись: старт');
   note.parts = 0;
-  notes.unshift(note);
+  if (!clip) notes.unshift(note);
   saveNote(note);
   try { wake = await navigator.wakeLock?.request('screen'); } catch {}
   renderRec();
@@ -431,8 +480,8 @@ async function startRecording() {
     const pcm = r.takeNew();
     if (!pcm.length) return;
     const k = note.parts++;
-    note.duration = r.seconds;
-    await DB.put('audio', encodeWav(pcm), note.id + ':p' + k);
+    if (clip) clip.duration = r.seconds; else note.duration = r.seconds;
+    await DB.put('audio', encodeWav(pcm), recKey + ':p' + k);
     saveNote(note);
   }, 5000);
   // модель грузим чуть позже, чтобы запись точно успела стартовать
@@ -451,24 +500,36 @@ async function stopRecording() {
   const pcm = await rec_stop(r);
   try { await wake?.release(); } catch {}
   wake = null;
-  note.duration = pcm.length ? pcm.length / 16000 : r.seconds;
-  if (S.keepAudio && pcm.length) { await DB.put('audio', encodeWav(pcm), note.id); note.hasAudio = true; }
-  for (let i = 0; i < (note.parts || 0); i++) await DB.del('audio', note.id + ':p' + i);
+  const clip = note.recClip ? (note.clips || []).find((c) => c.id === note.recClip) : null;
+  const key = clip ? clipKey(note, clip) : note.id, holder = clip || note;
+  delete note.recClip;
+  holder.duration = pcm.length ? pcm.length / 16000 : r.seconds;
+  if (S.keepAudio && pcm.length) { await DB.put('audio', encodeWav(pcm), key); holder.hasAudio = true; }
+  for (let i = 0; i < (note.parts || 0); i++) await DB.del('audio', key + ':p' + i);
   note.parts = 0;
   note.status = jobs.has(note.id) ? 'transcribing' : 'done';
   finishIfDone(note);
-  if (S.pcAuto && pcOn() && note.hasAudio) note.pc = { state: 'outbox', sentAt: Date.now(), base: note.text || '' };
+  if (S.pcAuto && pcOn() && holder.hasAudio) holder.pc = { state: 'outbox', sentAt: Date.now(), base: clip ? clipRange(note, clip)?.body || '' : note.text || '' };
   saveNote(note);
-  if (note.pc) pcSync();
+  if (holder.pc) pcSync();
   $('.rec')?.remove();
-  location.hash = '#/n/' + note.id;
+  editMode = false;
+  if (location.hash === '#/n/' + note.id) render(); else location.hash = '#/n/' + note.id;
+  if (clip) toast('Дописано в заметку');
 }
 
 function renderRec() {
   const el = document.createElement('div');
   el.className = 'rec';
   const quick = ['идея', 'баг', 'задача', 'вопрос'];
-  el.innerHTML = `
+  const into = recNote.recClip ? `<div class="small center" style="padding:10px 0 4px">Дописываю в «${esc(titleOf(recNote))}» — прежний текст не изменится</div>` : '';
+  el.innerHTML = into ? `${into}
+    <div class="timer" id="rtime">0:00</div>
+    <div class="meter"><i id="rlvl"></i></div>
+    <div class="small center" id="recq">${esc(recInfo())}</div>
+    <div class="live" id="rlive"><span class="pend">Говорите… новый текст появится здесь.</span></div>
+    <button class="stopbtn" id="rstop" aria-label="Остановить"><i></i></button>
+    <div class="small center" style="margin-top:10px">Нажмите, чтобы остановить.</div>` : `
     <div class="chips" id="rqt">
       <button class="chip" data-proj>${I.folder.replace('<svg', '<svg width="14" height="14" style="vertical-align:-2px"')} ${esc(projName(recNote.projectId) || 'Без проекта')}</button>
       ${quick.map((t) => `<button class="chip tag ${recNote.tags.includes(t) ? 'on' : ''}" data-t="${t}">#${t}</button>`).join('')}
@@ -481,6 +542,7 @@ function renderRec() {
     <div class="small center" style="margin-top:10px">Нажмите, чтобы остановить. Распознавание доделается в фоне.</div>`;
   document.body.appendChild(el);
   $('#rstop').onclick = stopRecording;
+  if (into) return;
   el.querySelectorAll('[data-t]').forEach((b) => (b.onclick = () => {
     const t = b.dataset.t, i = recNote.tags.indexOf(t);
     if (i >= 0) recNote.tags.splice(i, 1); else recNote.tags.push(t);
@@ -626,7 +688,19 @@ const PC = {
   busy: false, timer: null, dirsOk: false,
 };
 const pcOn = () => !!PC.token();
+// pcActive/pcBoxHTML работают и с заметкой, и с отдельной записью журнала (у обеих есть .pc / .pcText)
 const pcActive = (n) => n.pc && (n.pc.state === 'outbox' || n.pc.state === 'queued');
+const pcAnyActive = (n) => pcActive(n) || (n.clips || []).some(pcActive);
+const pcAnyReady = (n) => n.pc?.state === 'ready' || (n.clips || []).some((c) => c.pc?.state === 'ready');
+// всё, что отправлено на ПК: заметка целиком (ключ = id) и записи журнала (ключ = id--clip)
+function pcUnits() {
+  const out = [];
+  for (const n of notes) {
+    if (n.pc) out.push({ n, o: n, key: n.id });
+    for (const c of n.clips || []) if (c.pc) out.push({ n, o: c, c, key: clipKey(n, c) });
+  }
+  return out;
+}
 function pcOnlineText() {
   const p = PC.seen();
   if (!p?.seen) return { on: false, text: 'Программа на компьютере ещё ни разу не выходила на связь.' };
@@ -641,20 +715,21 @@ function addVersion(n, label, text) {
   n.versions = n.versions.slice(0, 8);
 }
 function setText(n, text) { n.text = text; n.segTexts = null; n.prefix = ''; }
-async function sendToPC(n, quiet) {
+async function sendToPC(n, quiet, c) {
   if (!pcOn()) { toast('Сначала подключите Яндекс Диск в настройках'); location.hash = '#/settings'; return; }
-  if (!n.hasAudio) { toast('У заметки нет аудио'); return; }
-  if (pcActive(n)) { toast('Уже в очереди на компьютер'); return; }
-  if (n.pc?.state === 'ready') { toast('Расшифровка с ПК уже готова — выберите, что с ней сделать'); return; }
-  n.pc = { state: 'outbox', sentAt: Date.now(), base: n.text || '' };
-  trace('ПК: в очередь ' + n.id);
+  const o = c || n;
+  if (!o.hasAudio) { toast('У заметки нет аудио'); return; }
+  if (pcActive(o)) { toast('Уже в очереди на компьютер'); return; }
+  if (o.pc?.state === 'ready') { toast('Расшифровка с ПК уже готова — выберите, что с ней сделать'); return; }
+  o.pc = { state: 'outbox', sentAt: Date.now(), base: c ? clipRange(n, c)?.body || '' : n.text || '' };
+  trace('ПК: в очередь ' + (c ? clipKey(n, c) : n.id));
   saveNote(n); onNoteChanged(n);
   if (!quiet) toast(pcOnlineText().on ? 'Отправляю на компьютер…' : 'Компьютер выключен — задание будет ждать в очереди');
   pcSync();
 }
-async function cancelPC(n) {
-  const was = n.pc?.state; n.pc = null; saveNote(n); onNoteChanged(n);
-  if (was === 'queued') try { await PC.disk().remove(`app:/jobs/${n.id}.wav`); } catch {}
+async function cancelPC(n, c) {
+  const o = c || n, was = o.pc?.state; o.pc = null; saveNote(n); onNoteChanged(n);
+  if (was === 'queued') try { await PC.disk().remove(`app:/jobs/${c ? clipKey(n, c) : n.id}.wav`); } catch {}
 }
 // Пришла расшифровка с ПК. Если текст не трогали после отправки — подставляем сами,
 // если трогали — ничего не перезаписываем, показываем плашку с выбором.
@@ -666,6 +741,27 @@ function applyPCResult(n, res) {
   n.pc = { ...n.pc, state: untouched ? 'done' : 'ready', model: res.model, device: res.device, doneAt: Date.now() };
   if (untouched) { addVersion(n, 'До компьютера', n.text); setText(n, text); delete n.pcText; if (n.status !== 'recording') n.status = 'done'; return 'replaced'; }
   n.pcText = text; return 'ready';
+}
+// То же для записи журнала: заменяется только её раздел и только если его не правили после отправки
+function applyClipResult(n, c, res) {
+  if (res.error) { c.pc = { ...c.pc, state: 'error', err: res.error }; return 'error'; }
+  const text = (res.text || '').trim();
+  const editing = $('#ntext') && lastNoteId === n.id;
+  const r = clipRange(n, c);
+  const untouched = !editing && r && r.body === (c.pc?.base || '').trim();
+  c.pc = { ...c.pc, state: untouched ? 'done' : 'ready', model: res.model, device: res.device, doneAt: Date.now() };
+  if (untouched) { addVersion(n, 'До компьютера', n.text); setClipBody(n, r, text); delete c.pcText; return 'replaced'; }
+  c.pcText = text; return 'ready';
+}
+function resolveClipPC(n, c, how) {
+  const t = c.pcText || '', r = clipRange(n, c);
+  if (how === 'replace' && r) { addVersion(n, 'Мой текст', n.text); setClipBody(n, r, t); }
+  else if (how === 'append' && r) setClipBody(n, r, r.body + '\n\n— Расшифровка с компьютера —\n' + t);
+  // раздел не найден (заголовок стёрли) — добавляем расшифровку в конец, ничего не заменяя
+  else if (how === 'append' || how === 'replace') setText(n, (n.text || '').trimEnd() + `\n\n— Расшифровка с компьютера (запись ${clipTime(c)}) —\n` + t);
+  else addVersion(n, `С компьютера (запись ${clipTime(c)})`, t);
+  delete c.pcText; c.pc = { ...c.pc, state: 'done' };
+  saveNote(n); renderNote(n.id);
 }
 function resolvePC(n, how) {
   const t = n.pcText || '';
@@ -690,13 +786,13 @@ async function pcSync() {
   const d = PC.disk();
   try {
     if (!PC.dirsOk) { await d.mkdir('app:/jobs'); await d.mkdir('app:/results'); PC.dirsOk = true; }
-    for (const n of notes.filter((x) => x.pc?.state === 'outbox')) {
-      const blob = await DB.get('audio', n.id);
-      if (!blob) { n.pc = { ...n.pc, state: 'error', err: 'аудио не найдено' }; saveNote(n); continue; }
-      await d.upload(`app:/jobs/${n.id}.wav`, blob);
-      try { await d.props(`app:/jobs/${n.id}.wav`, { lang: S.lang, sentAt: n.pc.sentAt }); } catch {}
-      n.pc = { ...n.pc, state: 'queued' }; saveNote(n); onNoteChanged(n);
-      trace(`ПК: загружено ${n.id} (${(blob.size / 1e6).toFixed(1)} МБ)`);
+    for (const { n, o, key } of pcUnits().filter((u) => u.o.pc.state === 'outbox')) {
+      const blob = await DB.get('audio', key);
+      if (!blob) { o.pc = { ...o.pc, state: 'error', err: 'аудио не найдено' }; saveNote(n); continue; }
+      await d.upload(`app:/jobs/${key}.wav`, blob);
+      try { await d.props(`app:/jobs/${key}.wav`, { lang: S.lang, sentAt: o.pc.sentAt }); } catch {}
+      o.pc = { ...o.pc, state: 'queued' }; saveNote(n); onNoteChanged(n);
+      trace(`ПК: загружено ${key} (${(blob.size / 1e6).toFixed(1)} МБ)`);
     }
     try {
       const m = await d.meta('app:/pc.json');
@@ -707,10 +803,11 @@ async function pcSync() {
     PC.working = new Set(jobsOnDisk.filter((f) => f.custom_properties?.status === 'working').map((f) => f.name.replace(/\.wav$/, '')));
     for (const f of await d.list('app:/results')) {
       const id = f.name.replace(/\.json$/, '');
-      const n = notes.find((x) => x.id === id);
-      if (n && pcActive(n)) {
+      const u = pcUnits().find((x) => x.key === id);
+      if (u && pcActive(u.o)) {
+        const n = u.n;
         const res = JSON.parse(await d.download('app:/results/' + f.name));
-        const how = applyPCResult(n, res);
+        const how = u.c ? applyClipResult(n, u.c, res) : applyPCResult(n, res);
         trace(`ПК: результат ${id} → ${how}`);
         saveNote(n); onNoteChanged(n);
         toast(how === 'error' ? 'Компьютер не смог распознать запись' : how === 'replaced' ? `Готова расшифровка с компьютера: «${titleOf(n)}»` : `Расшифровка с компьютера готова — ваш исправленный текст не тронут`, 4000);
@@ -724,33 +821,44 @@ async function pcSync() {
   } finally {
     PC.busy = false;
     const r = route();
-    if (r.name === 'note') { const n = notes.find((x) => x.id === r.id); if (n && (n.pc || n.pcText)) { const st = $('#npc'); if (st) st.innerHTML = pcBoxHTML(n); bindPCBox(n); } }
+    if (r.name === 'note') {
+      const n = notes.find((x) => x.id === r.id);
+      if (n && (n.pc || n.pcText)) { const st = $('#npc'); if (st) st.innerHTML = pcBoxHTML(n); }
+      for (const c of n?.clips || []) { const st = $(`[data-cpcbox="${c.id}"]`); if (st) st.innerHTML = pcBoxHTML(c, c.id); }
+      if (n) bindPCBox(n);
+    }
     clearTimeout(PC.timer);
     // пока что-то ждёт компьютер — проверяем раз в 20 с, иначе раз в 2 мин (обновить «ПК в сети»)
-    if (pcOn() && !document.hidden) PC.timer = setTimeout(pcSync, notes.some(pcActive) ? 20000 : 120000);
+    if (pcOn() && !document.hidden) PC.timer = setTimeout(pcSync, notes.some(pcAnyActive) ? 20000 : 120000);
   }
 }
-function pcBoxHTML(n) {
-  const p = n.pc;
-  if (n.pcText && p?.state === 'ready') return `<div class="warnbox pcbox"><b>Готова расшифровка с компьютера</b>${p.model ? ' <span class="small">(' + esc(p.model) + ')</span>' : ''}. Вы правили текст после отправки, поэтому он не заменён.
-    <div class="btns" style="margin-top:8px"><button class="btn" data-pc="diff">Сравнить</button><button class="btn primary" data-pc="replace">Заменить</button><button class="btn" data-pc="append">Добавить ниже</button><button class="btn" data-pc="reject">Оставить мой</button></div></div>`;
+// cid — id записи журнала (кнопки тогда относятся к ней, а не ко всей заметке)
+function pcBoxHTML(n, cid = '') {
+  const p = n.pc, B = (a, label, cls = '') => `<button class="btn ${cls}" data-pc="${a}" data-cid="${cid}">${label}</button>`;
+  if (n.pcText && p?.state === 'ready') return `<div class="warnbox pcbox"><b>Готова расшифровка с компьютера</b>${p.model ? ' <span class="small">(' + esc(p.model) + ')</span>' : ''}. Вы правили ${cid ? 'этот раздел' : 'текст'} после отправки, поэтому он не заменён.
+    <div class="btns" style="margin-top:8px">${B('diff', 'Сравнить')}${B('replace', 'Заменить', 'primary')}${B('append', 'Добавить ниже')}${B('reject', 'Оставить мой')}</div></div>`;
   if (!p) return '';
-  if (p.state === 'error') return `<div class="warnbox">Компьютер не смог распознать запись: ${esc(p.err || 'ошибка')}. <a data-pc="retry">Отправить ещё раз</a></div>`;
+  if (p.state === 'error') return `<div class="warnbox">Компьютер не смог распознать запись: ${esc(p.err || 'ошибка')}. <a data-pc="retry" data-cid="${cid}">Отправить ещё раз</a></div>`;
   if (!pcActive(n)) return '';
   const on = pcOnlineText();
   const what = p.state === 'outbox' ? 'Ждёт отправки на Яндекс Диск (нет связи?).'
     : PC.working?.has(n.id) ? 'Компьютер распознаёт запись…'
     : on.on ? 'В очереди, компьютер в сети — скоро будет готово.' : `${on.text} Задание в очереди: расшифровка появится, когда он включится.`;
   return `<div class="warnbox">🖥 ${esc(what)}${PC.err ? `<div class="small" style="margin-top:4px">Последняя ошибка: ${esc(PC.err)}</div>` : ''}
-    <div class="btns" style="margin-top:8px"><button class="btn" data-pc="check">Проверить сейчас</button><button class="btn" data-pc="cancel">Отменить</button></div></div>`;
+    <div class="btns" style="margin-top:8px">${B('check', 'Проверить сейчас')}${B('cancel', 'Отменить')}</div></div>`;
 }
 function bindPCBox(n) {
   app.querySelectorAll('[data-pc]').forEach((b) => (b.onclick = () => {
-    const a = b.dataset.pc;
-    if (a === 'diff') showDiff(n.text || '', n.pcText || '', 'Ваш текст ↔ компьютер');
-    else if (a === 'check') { toast('Проверяю…'); pcSync(); }
-    else if (a === 'cancel') cancelPC(n);
-    else if (a === 'retry') { n.pc = null; sendToPC(n); }
+    const a = b.dataset.pc, c = b.dataset.cid ? (n.clips || []).find((x) => x.id === b.dataset.cid) : null;
+    if (b.dataset.cid && !c) return;
+    if (a === 'check') { toast('Проверяю…'); pcSync(); }
+    else if (a === 'cancel') cancelPC(n, c);
+    else if (a === 'retry') { (c || n).pc = null; sendToPC(n, false, c); }
+    else if (c) {
+      if (a === 'diff') showDiff(clipRange(n, c)?.body || '', c.pcText || '', `Запись ${clipTime(c)} ↔ компьютер`);
+      else resolveClipPC(n, c, a);
+    }
+    else if (a === 'diff') showDiff(n.text || '', n.pcText || '', 'Ваш текст ↔ компьютер');
     else resolvePC(n, a);
   }));
 }
@@ -848,7 +956,7 @@ function renderHome() {
   <main class="wrap">${crashNote ? `<div class="warnbox" id="crash">${esc(crashNote)} <a href="#/settings">Настройки</a> · <a id="crashok">Понятно</a></div>` : ''}<div class="list" id="list"></div></main>
   <button class="fab" id="fab" aria-label="Записать">${I.mic}</button>`;
   $('#q').oninput = (e) => { filter.q = e.target.value; renderList(); };
-  $('#fab').onclick = startRecording;
+  $('#fab').onclick = () => startRecording();
   $('#impbtn').onclick = pickAudioFiles;
   const ok = $('#crashok'); if (ok) ok.onclick = () => { crashNote = ''; $('#crash').remove(); };
   renderChips(); renderList();
@@ -890,12 +998,13 @@ function renderList() {
   if (!list.length) { el.innerHTML = '<div class="empty">Ничего не найдено</div>'; return; }
   el.innerHTML = list.map((n) => {
     const st = n.status === 'transcribing' || n.status === 'recording' ? '<span>⏳ распознаётся</span>' : n.status === 'error' ? '<span style="color:var(--accent)">⚠︎ ошибка</span>' : '';
-    const pcs = pcActive(n) ? '<span>🖥 ждёт ПК</span>' : n.pc?.state === 'ready' ? '<span style="color:var(--warn)">🖥 готово, выберите</span>' : '';
+    const pcs = pcAnyActive(n) ? '<span>🖥 ждёт ПК</span>' : pcAnyReady(n) ? '<span style="color:var(--warn)">🖥 готово, выберите</span>' : '';
+    const nc = (n.clips || []).length;
     const links = linksOf(n).length;
     return `<a class="card" href="#/n/${encodeURIComponent(n.id)}">
       <div class="t">${esc(titleOf(n))}</div>
-      <div class="s">${esc((n.text || '').slice(0, 220)) || '<i>без текста</i>'}</div>
-      <div class="meta"><span>${fmtDate(n.createdAt)}</span>${n.source === 'file' ? '<span>📎 файл</span>' : ''}${n.duration ? `<span>${fmtDur(n.duration)}</span>` : ''}
+      <div class="s">${esc((n.text || '').replace(/^#{1,6} /gm, '').slice(0, 220)) || '<i>без текста</i>'}</div>
+      <div class="meta"><span>${fmtDate(n.createdAt)}</span>${n.source === 'file' ? '<span>📎 файл</span>' : ''}${n.duration ? `<span>${fmtDur(n.duration)}</span>` : ''}${nc ? `<span>🎙 ${nc}</span>` : ''}
         ${n.projectId ? `<span class="badge">${esc(projName(n.projectId) || '?')}</span>` : ''}
         ${tagsOf(n).slice(0, 4).map((t) => `<span class="tg">#${esc(t)}</span>`).join('')}
         ${links ? `<span>🔗 ${links}</span>` : ''}${st}${pcs}</div></a>`;
@@ -912,7 +1021,9 @@ function renderedText(n) {
     return `<a class="lk ${target ? '' : 'missing'}" data-link="${t}">${label}</a>`;
   });
   h = h.replace(/(^|[\s(,.;:!?])#([\p{L}\p{N}_\-/]+)/gu, (_, p, t) => `${p}<a class="tg" data-tag="${t.toLowerCase()}">#${t}</a>`);
-  return h || '<span class="small">Текста пока нет</span>';
+  // заголовки разделов (### 🎙 дата записи) — как подписи в журнале
+  h = h.replace(/^#{1,6} (.+)$/gm, '<span class="jh">$1</span>');
+  return h || '<span class="small">Текста пока нет. Нажмите красную кнопку внизу и надиктуйте — запись допишется сюда.</span>';
 }
 function statusHTML(n) {
   const j = jobs.get(n.id);
@@ -923,7 +1034,7 @@ function statusHTML(n) {
   if (n.recovered && n.status !== 'done') return `<div class="warnbox">Запись восстановлена после сбоя приложения (${fmtDur(n.duration)}). ${RETRY_HINT}</div>`;
   if (n.status === 'transcribing' || n.status === 'recording') return `<div class="warnbox">Распознавание было прервано (приложение закрывалось). ${n.hasAudio ? RETRY_HINT : ''}</div>`;
   if (n.status === 'error') return `<div class="warnbox">Часть записи не распознана. ${RETRY_HINT}</div>`;
-  if (n.source === 'file' && !n.text && IS_IOS) return `<div class="warnbox">Голосовое добавлено из файла, аудио ниже. Распознать файл на iPhone пока нельзя: встроенное распознавание Apple слушает только микрофон, а Whisper в Safari вылетает. Нажмите «🖥 Распознать на ПК» ниже или впишите текст в «Правке».</div>`;
+  if (n.source === 'file' && !n.text && IS_IOS && !(n.clips || []).length) return `<div class="warnbox">Голосовое добавлено из файла, аудио ниже. Распознать файл на iPhone пока нельзя: встроенное распознавание Apple слушает только микрофон, а Whisper в Safari вылетает. Нажмите «🖥 Распознать на ПК» ниже или впишите текст в «Правке».</div>`;
   return '';
 }
 function renderNote(id) {
@@ -931,6 +1042,7 @@ function renderNote(id) {
   if (!n) { app.innerHTML = '<div class="wrap empty">Заметка не найдена. <a href="#/">На главную</a></div>'; return; }
   if (lastNoteId !== id) { editMode = !n.text && n.status === 'done'; lastNoteId = id; }
   const busy = n.status === 'transcribing' && jobs.has(n.id);
+  const clips = n.clips || [];
   const backlinks = notes.filter((o) => o.id !== n.id && linksOf(o).some((l) => l.toLowerCase() === titleOf(n).toLowerCase() || (n.title && l.toLowerCase() === n.title.trim().toLowerCase())));
   const outgoing = linksOf(n);
   app.innerHTML = `
@@ -939,7 +1051,7 @@ function renderNote(id) {
     <div class="grow small">${fmtDate(n.createdAt)}${n.duration ? ' · ' + fmtDur(n.duration) : ''}${n.fileName ? ' · 📎 ' + esc(n.fileName) : ''}</div>
     <div class="seg" style="width:170px"><button data-m="0" class="${!editMode ? 'on' : ''}">Просмотр</button><button data-m="1" class="${editMode ? 'on' : ''}">Правка</button></div>
   </div></header>
-  <main class="wrap" style="padding-bottom:60px">
+  <main class="wrap" style="padding-bottom:130px">
     <input class="title-in" id="ntitle" placeholder="${esc(titleOf(n))}" value="${esc(n.title || '')}">
     <div class="chips">
       <button class="chip" id="nproj">${I.folder.replace('<svg', '<svg width="14" height="14" style="vertical-align:-2px"')} ${esc(projName(n.projectId) || 'Без проекта')}</button>
@@ -957,23 +1069,36 @@ function renderNote(id) {
     <div class="sec">Ссылаются сюда</div>
     ${backlinks.length ? backlinks.map((b) => `<a class="card" href="#/n/${encodeURIComponent(b.id)}" style="margin-bottom:6px"><div class="t">${esc(titleOf(b))}</div><div class="meta">${fmtDate(b.createdAt)}</div></a>`).join('') : '<div class="small">Пока никто. Напишите [[' + esc(titleOf(n)) + ']] в другой заметке.</div>'}
     ${versionsHTML(n)}
-    <div class="sec">Аудио</div>
-    <div id="naudio" class="small">${n.hasAudio ? 'Загрузка…' : 'Не сохранено'}</div>
+    <div class="sec">Аудио${clips.length ? ' · записей: ' + (clips.length + (n.hasAudio ? 1 : 0)) : ''}</div>
+    ${n.hasAudio || !clips.length ? `${clips.length ? '<div class="small" style="margin-bottom:4px">Первая запись</div>' : ''}<div id="naudio" class="small">${n.hasAudio ? 'Загрузка…' : 'Не сохранено'}</div>` : ''}
     <div class="btns" style="margin-top:10px">
       ${n.hasAudio && !pcActive(n) && n.pc?.state !== 'ready' ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
-      ${n.hasAudio && !IS_IOS ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
-      <button class="btn danger" id="del">Удалить</button>
+      ${n.hasAudio && !IS_IOS && !clips.length ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
+      ${clips.length ? '' : '<button class="btn danger" id="del">Удалить</button>'}
     </div>
-  </main>`;
+    ${clips.map((c) => `<div class="card" style="margin-top:10px" data-clip="${c.id}">
+      <div class="meta" style="margin:0 0 4px"><b>🎙 ${esc(clipTime(c))}</b>${c.duration ? `<span>${fmtDur(c.duration)}</span>` : ''}${clipRange(n, c) ? '' : '<span>раздел в тексте удалён</span>'}</div>
+      <div data-caudio="${c.id}" class="small">${c.hasAudio ? 'Загрузка…' : 'Аудио не сохранено'}</div>
+      <div data-cpcbox="${c.id}">${pcBoxHTML(c, c.id)}</div>
+      <div class="btns" style="margin-top:8px">
+        ${c.hasAudio && !pcActive(c) && c.pc?.state !== 'ready' ? `<button class="btn" data-ctopc="${c.id}">🖥 Распознать на ПК</button>` : ''}
+        <button class="btn danger" data-cdel="${c.id}">Удалить аудио</button>
+      </div></div>`).join('')}
+    ${clips.length ? '<div class="btns" style="margin-top:14px"><button class="btn danger" id="del">Удалить заметку</button></div>' : ''}
+  </main>
+  ${busy || n.status === 'recording' ? '' : `<button class="fab" id="nfab" aria-label="Дописать голосом" title="Дописать голосом">${I.mic}</button>`}`;
 
   app.querySelectorAll('[data-m]').forEach((b) => (b.onclick = () => {
     if (busy && b.dataset.m === '1') { toast('Дождитесь окончания распознавания'); return; }
     editMode = b.dataset.m === '1'; renderNote(id);
   }));
   $('#ntitle').oninput = (e) => { n.title = e.target.value; saveNote(n, 500); };
-  const ta = $('#ntext');
+  const ta = $('#ntext'), fab = $('#nfab');
+  if (fab) fab.onclick = () => { if (ta) n.text = ta.value; startRecording(n); };
   if (ta) {
     let sugT;
+    // кнопка записи не должна закрывать текст над клавиатурой
+    if (fab) { ta.onfocus = () => (fab.style.display = 'none'); ta.onblur = () => setTimeout(() => (fab.style.display = ''), 150); }
     ta.oninput = () => {
       n.text = ta.value; n.segTexts = null; n.prefix = ''; saveNote(n, 500);
       clearTimeout(sugT); sugT = setTimeout(() => bindSug(n), 800);
@@ -1010,8 +1135,24 @@ function renderNote(id) {
     if (!confirm('Удалить заметку безвозвратно?')) return;
     notes = notes.filter((x) => x.id !== n.id); jobs.delete(n.id);
     await DB.del('notes', n.id); await DB.del('audio', n.id);
+    for (const c of clips) await DB.del('audio', clipKey(n, c));
     location.hash = '#/';
   };
+  for (const c of clips) {
+    if (c.hasAudio) DB.get('audio', clipKey(n, c)).then((blob) => {
+      const box = $(`[data-caudio="${c.id}"]`); if (!box) return;
+      if (!blob) { box.textContent = 'Не найдено'; return; }
+      box.innerHTML = `<audio controls preload="metadata" src="${URL.createObjectURL(blob)}"></audio><div>${(blob.size / 1e6).toFixed(1)} МБ</div>`;
+    });
+  }
+  app.querySelectorAll('[data-ctopc]').forEach((b) => (b.onclick = () => sendToPC(n, false, clips.find((c) => c.id === b.dataset.ctopc))));
+  app.querySelectorAll('[data-cdel]').forEach((b) => (b.onclick = async () => {
+    const c = clips.find((x) => x.id === b.dataset.cdel); if (!c) return;
+    if (!confirm('Удалить аудио этой записи? Её текст в заметке останется.')) return;
+    if (pcActive(c)) await cancelPC(n, c);
+    await DB.del('audio', clipKey(n, c));
+    n.clips = n.clips.filter((x) => x !== c); saveNote(n); renderNote(n.id);
+  }));
   if (n.hasAudio) DB.get('audio', n.id).then((blob) => {
     const box = $('#naudio'); if (!box) return;
     if (!blob) { box.textContent = 'Не найдено'; return; }
@@ -1285,6 +1426,14 @@ async function exportMarkdown(withAudio) {
       const blob = await DB.get('audio', n.id);
       if (blob) { zip.file(`audio/${n.id}.wav`, blob); body += `\n\n![[audio/${n.id}.wav]]`; }
     }
+    // записи журнала: аудио встраивается сразу под заголовком своего раздела
+    if (withAudio) for (const c of n.clips || []) {
+      if (!c.hasAudio) continue;
+      const blob = await DB.get('audio', clipKey(n, c)); if (!blob) continue;
+      const f = `audio/${clipKey(n, c)}.wav`, embed = `![[${f}]]`;
+      zip.file(f, blob);
+      body = c.head && body.includes(c.head) ? body.replace(c.head, c.head + '\n' + embed) : body + `\n\n${embed}`;
+    }
     zip.file((proj ? safeName(proj) + '/' : '') + name + '.md', body + '\n');
   }
   const blob = await zip.generateAsync({ type: 'blob' });
@@ -1300,7 +1449,7 @@ async function importJSON(e) {
     const d = JSON.parse(await f.text());
     let added = 0;
     for (const p of d.projects || []) if (!projects.find((x) => x.id === p.id)) { projects.push(p); await DB.put('projects', p); }
-    for (const n of d.notes || []) if (!notes.find((x) => x.id === n.id)) { if (n.status !== 'done') n.status = 'done'; n.hasAudio = false; notes.push(n); await DB.put('notes', n); added++; }
+    for (const n of d.notes || []) if (!notes.find((x) => x.id === n.id)) { if (n.status !== 'done') n.status = 'done'; n.hasAudio = false; (n.clips || []).forEach((c) => (c.hasAudio = false)); notes.push(n); await DB.put('notes', n); added++; }
     toast(`Импортировано заметок: ${added}`); renderSettings();
   } catch (err) { toast('Не удалось прочитать файл: ' + err.message); }
 }
@@ -1340,17 +1489,21 @@ async function importJSON(e) {
   // 2) Восстанавливаем записи, прерванные вылетом
   for (const n of notes) {
     if (n.status !== 'recording') continue;
+    // дозапись в существующую заметку: звук собираем в аудио этой записи, а не всей заметки
+    const clip = n.recClip ? (n.clips || []).find((c) => c.id === n.recClip) : null;
+    const key = clip ? clipKey(n, clip) : n.id, holder = clip || n;
     if (n.parts > 0) {
       const pieces = [];
-      for (let i = 0; i < n.parts; i++) { const b = await DB.get('audio', n.id + ':p' + i); if (b) pieces.push(await decodeWav(b)); }
+      for (let i = 0; i < n.parts; i++) { const b = await DB.get('audio', key + ':p' + i); if (b) pieces.push(await decodeWav(b)); }
       const len = pieces.reduce((s, p) => s + p.length, 0);
       const all = new Float32Array(len); let o = 0;
       for (const p of pieces) { all.set(p, o); o += p.length; }
-      if (len) { await DB.put('audio', encodeWav(all), n.id); n.hasAudio = true; n.duration = len / 16000; }
-      for (let i = 0; i < n.parts; i++) await DB.del('audio', n.id + ':p' + i);
+      if (len) { await DB.put('audio', encodeWav(all), key); holder.hasAudio = true; holder.duration = len / 16000; }
+      for (let i = 0; i < n.parts; i++) await DB.del('audio', key + ':p' + i);
       n.parts = 0;
     }
-    n.recovered = true; n.status = 'error';
+    delete n.recClip;
+    if (clip) { clip.recovered = true; n.status = 'done'; } else { n.recovered = true; n.status = 'error'; }
     await DB.put('notes', n);
   }
 
