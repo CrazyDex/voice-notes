@@ -97,8 +97,10 @@ class Disk:
             raise ApiError(r.status_code, msg[:200])
         return r.json() if r.content else None
 
-    def info(self):
-        return self.req('GET', '/')
+    def check(self):
+        # у ключа доступ только к папке приложения — проверяем созданием app:/jobs
+        self.mkdir('app:/jobs')
+        return self.req('GET', '/resources', {'path': 'app:/jobs', 'fields': 'name'})
 
     def list(self, d):
         j = self.req('GET', '/resources', {'path': d, 'limit': 500, 'sort': 'created',
@@ -339,13 +341,13 @@ def setup(cfg):
         return 1
     d = Disk(tok)
     try:
-        info = d.info()
+        d.check()
     except Exception as e:
         print('Ключ не подошёл:', e)
         return 1
     with open(TOKEN_FILE, 'w', encoding='utf-8') as f:
         f.write(tok)
-    print('Яндекс Диск:', (info.get('user') or {}).get('login', 'подключён'))
+    print('Яндекс Диск: подключён')
     a = Agent(tok, cfg)
     a.setup_dirs()
     a.beat(force=True)

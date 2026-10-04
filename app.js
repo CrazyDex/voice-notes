@@ -1,5 +1,5 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.2';
-import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.2';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.3';
+import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.3';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.2';
+const VERSION = '1.3';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -169,7 +169,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=1.2', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=1.3', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -1108,19 +1108,19 @@ function bindPCSettings() {
   const sv = $('#ydsave');
   if (sv) sv.onclick = async () => {
     const t = $('#ydtok').value.trim().replace(/^.*access_token=([^&]+).*$/, '$1'); if (!t) { toast('Вставьте ключ'); return; }
-    try { const i = await new YDisk(t, ls.get('vn.ydApi', API)).info(); ls.set('vn.ydToken', t); trace('ПК: Диск подключён ' + (i?.user?.login || '')); toast('Яндекс Диск подключён'); PC.dirsOk = false; pcSync(); renderSettings(); }
+    try { await new YDisk(t, ls.get('vn.ydApi', API)).check(); ls.set('vn.ydToken', t); trace('ПК: Диск подключён'); toast('Яндекс Диск подключён'); PC.dirsOk = false; pcSync(); renderSettings(); }
     catch (e) { toast('Ключ не подошёл: ' + (e.message || e), 5000); }
   };
   const tst = $('#ydtest');
   if (tst) tst.onclick = async () => {
     const msg = $('#ydmsg'), d = PC.disk(), say = (t) => { msg.textContent = t; trace('ПК: проверка — ' + t); };
     try {
-      say('Проверяю доступ…'); const i = await d.info();
+      say('Проверяю доступ…'); await d.check();
       say('Загрузка…'); const probe = 'проверка ' + Date.now(); await d.upload('app:/probe.txt', new Blob([probe]));
       say('Скачивание…'); const back = await d.download('app:/probe.txt'); await d.remove('app:/probe.txt');
       if (back !== probe) throw new Error('файл вернулся не таким');
       await pcSync();
-      say(`Всё работает: Диск ${i?.user?.login || ''}, загрузка и скачивание из браузера проходят. ${pcOnlineText().text}`);
+      say(`Всё работает: Диск отвечает, загрузка и скачивание из браузера проходят. ${pcOnlineText().text}`);
     } catch (e) { say('Ошибка: ' + (e.message || e) + '. Скопируйте журнал (внизу) и пришлите разработчику.'); }
   };
   const cp = $('#ydcopy');

@@ -23,7 +23,9 @@ export class YDisk {
     }
     return j;
   }
-  info() { return this.req('GET', '/'); }
+  // У ключа есть доступ только к папке приложения (без «информации о Диске»),
+  // поэтому проверяем его созданием папки app:/jobs, а не запросом GET /
+  async check() { await this.mkdir('app:/jobs'); return this.meta('app:/jobs'); }
   meta(path) { return this.req('GET', '/resources', { path, fields: 'name,modified,size,custom_properties' }); }
   async list(dir) {
     try {
