@@ -33,7 +33,7 @@ proxy_fix.fix(direct=_DIRECT)
 
 import requests  # noqa: E402  (после настройки прокси)
 
-AGENT_VERSION = '1.1'
+AGENT_VERSION = '1.2'
 API = os.environ.get('VN_YD_API', 'https://cloud-api.yandex.net/v1/disk')
 HOME = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'voice-notes-agent')
 TOKEN_FILE = os.path.join(HOME, 'token.txt')
@@ -49,6 +49,25 @@ DEFAULTS = {
     'unload_after_min': 10,     # выгружать модель из видеопамяти, если заданий нет
     'beam_size': 5,
 }
+PROMPT_RU = 'Это голосовая заметка. Я говорю короткими предложениями. Здесь стоят точки, запятые и вопросительные знаки. Всё понятно?'
+
+
+def punctuate(parts):
+    """Кусок речи между паузами — отдельная фраза: если модель не поставила знак в конце,
+    ставим точку, а следующую фразу начинаем с заглавной."""
+    out = []
+    for t in parts:
+        if out and re.search(r'[.!?…]$', out[-1]) and t[:1].islower():
+            t = t[:1].upper() + t[1:]
+        if not re.search(r'[.!?…,;:]$', t):
+            t += '.'
+        out.append(t)
+    text = ' '.join(out).strip()
+    if text:
+        text = text[:1].upper() + text[1:]
+    return text
+
+
 HALL = [r'субтитр', r'dimatorzok', r'продолжение следует', r'спасибо за просмотр', r'подпис(ыв)?айтесь', r'amara\.org', r'редактор']
 
 os.makedirs(HOME, exist_ok=True)
@@ -235,10 +254,15 @@ class Engine:
         return text, dur, time.time() - t0
 
     def _run(self, path, lang):
+        ru = lang in ('ru', None, '', 'auto')
         segs, info = self.model.transcribe(
             path, language=None if lang in (None, '', 'auto') else lang, beam_size=self.cfg['beam_size'],
             vad_filter=True, vad_parameters={'min_silence_duration_ms': 500},
-            condition_on_previous_text=False)
+            # пример хорошо расставленного текста задаёт модели стиль: точки, запятые, короткие фразы.
+            # Подсказка и предыдущий текст передаются в каждое окно, иначе после первых 30 с
+            # модель «забывает» про знаки препинания
+            initial_prompt=PROMPT_RU if ru else None,
+            condition_on_previous_text=True, compression_ratio_threshold=2.2, no_speech_threshold=0.6)
         parts = []
         for s in segs:
             t = s.text.strip()
@@ -246,8 +270,10 @@ class Engine:
                 continue
             if len(t) < 90 and any(re.search(h, t, re.I) for h in HALL):
                 continue
+            if parts and parts[-1] == t:  # повтор — типичная «петля» Whisper
+                continue
             parts.append(t)
-        return ' '.join(parts).strip(), info.duration
+        return punctuate(parts), info.duration
 
 
 # ---------------- Основной цикл ----------------
