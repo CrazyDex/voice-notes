@@ -95,12 +95,15 @@ audio{width:100%;margin-top:6px}
 .sheet{background:var(--bg);width:100%;max-height:80dvh;overflow:auto;border-radius:20px 20px 0 0;padding:16px 16px calc(var(--sab) + 16px)}
 .sheet .item{display:block;width:100%;text-align:left;padding:12px;border-radius:12px;background:var(--surface);margin-bottom:6px}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(var(--sab) + 110px);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:12px;z-index:40;font-size:14px;max-width:90vw}
+.diff del{color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);text-decoration:line-through}
+.diff ins{color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,transparent);text-decoration:underline}
+.vers summary{list-style:none}
 .warnbox{background:color-mix(in srgb,var(--warn) 15%,var(--surface));border-radius:12px;padding:10px 12px;font-size:14px;margin:8px 0}
 </style>
 </head>
 <body>
 <div id="app"></div>
-<script type="module" src="app.js?v=1.1"></script>
+<script type="module" src="app.js?v=1.2"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

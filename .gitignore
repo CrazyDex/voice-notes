@@ -4,3 +4,5 @@ github-token.txt
 .env
 Thumbs.db
 desktop.ini
+__pycache__/
+token.txt

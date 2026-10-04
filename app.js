@@ -1,10 +1,11 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.1';
+import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.2';
+import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.2';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 // Встроенное распознавание браузера (на iPhone — то же, что диктовка Siri)
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const DEFAULTS = { engine: SR && IS_IOS ? 'sys' : 'whisper', model: IS_IOS ? 'base' : 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true };
+const DEFAULTS = { engine: SR && IS_IOS ? 'sys' : 'whisper', model: IS_IOS ? 'base' : 'small', device: 'auto', lang: 'ru', segMax: 12, autoload: true, keepAudio: true, pcAuto: false };
 const MODELS = {
   tiny: { name: 'Tiny', size: '~45 МБ', note: 'Самая лёгкая. Много ошибок, но почти наверняка не вылетит — для проверки, что всё работает.' },
   base: { name: 'Base', size: '~80 МБ', note: 'Быстро и надёжно, но больше ошибок. Лучший вариант для «живого» текста на iPhone.' },
@@ -17,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.1';
+const VERSION = '1.2';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -168,7 +169,7 @@ const ASR = {
   rtf: ls.get('vn.rtf', null),
   init() {
     try {
-      this.w = new Worker('asr-worker.js?v=1.1', { type: 'module' });
+      this.w = new Worker('asr-worker.js?v=1.2', { type: 'module' });
       this.w.onmessage = (e) => this.on(e.data);
       this.w.onerror = (e) => { this.state = 'error'; this.msg = 'Модуль распознавания не запустился (нужен интернет при первом запуске).'; asrUI(); e.preventDefault?.(); };
     } catch (e) { this.state = 'error'; this.msg = String(e); }
@@ -367,7 +368,9 @@ async function stopRecording() {
   note.parts = 0;
   note.status = jobs.has(note.id) ? 'transcribing' : 'done';
   finishIfDone(note);
+  if (S.pcAuto && pcOn() && note.hasAudio) note.pc = { state: 'outbox', sentAt: Date.now(), base: note.text || '' };
   saveNote(note);
+  if (note.pc) pcSync();
   $('.rec')?.remove();
   location.hash = '#/n/' + note.id;
 }
@@ -513,12 +516,169 @@ async function retranscribe(note) {
   if (note.text && note.status === 'done' && !confirm('Текст будет заменён новым распознаванием. Продолжить?')) return;
   const pcm = await decodeWav(blob);
   const segs = segmentAll(pcm, { minSec: 3, maxSec: S.segMax, silenceMs: 500 });
+  addVersion(note, 'До перераспознавания', note.text);
   note.segTexts = []; note.prefix = ''; note.text = ''; note.status = 'transcribing';
   jobs.delete(note.id);
   if (!segs.length) { note.status = 'done'; toast('В записи не найдено речи'); }
   segs.forEach((s, i) => enqueue(note, s.a, i));
   saveNote(note);
   onNoteChanged(note);
+}
+
+/* ================= Распознавание на компьютере (через Яндекс Диск) ================= */
+// note.pc = { state: 'outbox' | 'queued' | 'ready' | 'done' | 'error', sentAt, base, model, err }
+//   outbox — ещё не загружено на Диск (нет сети), queued — ждёт ПК, ready — текст с ПК ждёт решения
+// note.pcText — расшифровка с ПК, если заметку успели поправить вручную (сама не подставляется)
+// note.versions — прежние варианты текста [{label, text, at}], чтобы ничего не терялось
+const PC = {
+  token: () => ls.get('vn.ydToken', ''),
+  disk: () => new YDisk(PC.token(), ls.get('vn.ydApi', API)),
+  seen: () => ls.get('vn.pcSeen', null), // {seen, model, device, busy}
+  busy: false, timer: null, dirsOk: false,
+};
+const pcOn = () => !!PC.token();
+const pcActive = (n) => n.pc && (n.pc.state === 'outbox' || n.pc.state === 'queued');
+function pcOnlineText() {
+  const p = PC.seen();
+  if (!p?.seen) return { on: false, text: 'Программа на компьютере ещё ни разу не выходила на связь.' };
+  if (Date.now() - p.seen < PC_ONLINE_MS) return { on: true, text: `Компьютер в сети${p.model ? ' · ' + p.model : ''}${p.device ? ' (' + (p.device === 'cuda' ? 'видеокарта' : 'процессор') + ')' : ''}.` };
+  return { on: false, text: `Компьютер выключен (был в сети ${ago(p.seen)}).` };
+}
+function addVersion(n, label, text) {
+  if (!text?.trim()) return;
+  n.versions = n.versions || [];
+  if (n.versions.some((v) => v.text === text)) return;
+  n.versions.unshift({ label, text, at: Date.now() });
+  n.versions = n.versions.slice(0, 8);
+}
+function setText(n, text) { n.text = text; n.segTexts = null; n.prefix = ''; }
+async function sendToPC(n, quiet) {
+  if (!pcOn()) { toast('Сначала подключите Яндекс Диск в настройках'); location.hash = '#/settings'; return; }
+  if (!n.hasAudio) { toast('У заметки нет аудио'); return; }
+  if (pcActive(n)) { toast('Уже в очереди на компьютер'); return; }
+  if (n.pc?.state === 'ready') { toast('Расшифровка с ПК уже готова — выберите, что с ней сделать'); return; }
+  n.pc = { state: 'outbox', sentAt: Date.now(), base: n.text || '' };
+  trace('ПК: в очередь ' + n.id);
+  saveNote(n); onNoteChanged(n);
+  if (!quiet) toast(pcOnlineText().on ? 'Отправляю на компьютер…' : 'Компьютер выключен — задание будет ждать в очереди');
+  pcSync();
+}
+async function cancelPC(n) {
+  const was = n.pc?.state; n.pc = null; saveNote(n); onNoteChanged(n);
+  if (was === 'queued') try { await PC.disk().remove(`app:/jobs/${n.id}.wav`); } catch {}
+}
+// Пришла расшифровка с ПК. Если текст не трогали после отправки — подставляем сами,
+// если трогали — ничего не перезаписываем, показываем плашку с выбором.
+function applyPCResult(n, res) {
+  if (res.error) { n.pc = { ...n.pc, state: 'error', err: res.error }; return 'error'; }
+  const text = (res.text || '').trim();
+  const editing = $('#ntext') && lastNoteId === n.id;
+  const untouched = !editing && (n.text || '').trim() === (n.pc?.base || '').trim();
+  n.pc = { ...n.pc, state: untouched ? 'done' : 'ready', model: res.model, device: res.device, doneAt: Date.now() };
+  if (untouched) { addVersion(n, 'До компьютера', n.text); setText(n, text); delete n.pcText; if (n.status !== 'recording') n.status = 'done'; return 'replaced'; }
+  n.pcText = text; return 'ready';
+}
+function resolvePC(n, how) {
+  const t = n.pcText || '';
+  if (how === 'replace') { addVersion(n, 'Мой текст', n.text); setText(n, t); }
+  else if (how === 'append') { setText(n, (n.text || '').trimEnd() + '\n\n— Расшифровка с компьютера —\n' + t); }
+  else addVersion(n, 'С компьютера', t);
+  delete n.pcText; n.pc = { ...n.pc, state: 'done' };
+  saveNote(n); renderNote(n.id);
+}
+function diffHTML(a, b) {
+  return diffWords(a, b).map((p) => p.t === '=' ? esc(p.s) : p.t === '-' ? `<del>${esc(p.s)}</del>` : `<ins>${esc(p.s)}</ins>`).join('');
+}
+function showDiff(a, b, title) {
+  sheet(`<div class="row" style="margin-bottom:10px"><b class="grow">${esc(title)}</b><button class="btn" data-close>Закрыть</button></div>
+    <div class="small" style="margin-bottom:8px"><del>зачёркнуто</del> — есть только в текущем тексте, <ins>подчёркнуто</ins> — только в другом варианте.</div>
+    <div class="rendered diff">${diffHTML(a, b)}</div>`, (el, close) => { $('[data-close]', el).onclick = close; });
+}
+// Синхронизация: загрузить задания из «исходящих», забрать готовые результаты, обновить «ПК в сети»
+async function pcSync() {
+  if (!pcOn() || PC.busy) return;
+  PC.busy = true;
+  const d = PC.disk();
+  try {
+    if (!PC.dirsOk) { await d.mkdir('app:/jobs'); await d.mkdir('app:/results'); PC.dirsOk = true; }
+    for (const n of notes.filter((x) => x.pc?.state === 'outbox')) {
+      const blob = await DB.get('audio', n.id);
+      if (!blob) { n.pc = { ...n.pc, state: 'error', err: 'аудио не найдено' }; saveNote(n); continue; }
+      await d.upload(`app:/jobs/${n.id}.wav`, blob);
+      try { await d.props(`app:/jobs/${n.id}.wav`, { lang: S.lang, sentAt: n.pc.sentAt }); } catch {}
+      n.pc = { ...n.pc, state: 'queued' }; saveNote(n); onNoteChanged(n);
+      trace(`ПК: загружено ${n.id} (${(blob.size / 1e6).toFixed(1)} МБ)`);
+    }
+    try {
+      const m = await d.meta('app:/pc.json');
+      const p = m.custom_properties || {};
+      if (p.seen) ls.set('vn.pcSeen', { seen: +p.seen, model: p.model, device: p.device, busy: p.busy });
+    } catch (e) { if (e.status !== 404) throw e; }
+    const jobsOnDisk = await d.list('app:/jobs');
+    PC.working = new Set(jobsOnDisk.filter((f) => f.custom_properties?.status === 'working').map((f) => f.name.replace(/\.wav$/, '')));
+    for (const f of await d.list('app:/results')) {
+      const id = f.name.replace(/\.json$/, '');
+      const n = notes.find((x) => x.id === id);
+      if (n && pcActive(n)) {
+        const res = JSON.parse(await d.download('app:/results/' + f.name));
+        const how = applyPCResult(n, res);
+        trace(`ПК: результат ${id} → ${how}`);
+        saveNote(n); onNoteChanged(n);
+        toast(how === 'error' ? 'Компьютер не смог распознать запись' : how === 'replaced' ? `Готова расшифровка с компьютера: «${titleOf(n)}»` : `Расшифровка с компьютера готова — ваш исправленный текст не тронут`, 4000);
+      }
+      await d.remove('app:/results/' + f.name);
+    }
+    PC.err = '';
+  } catch (e) {
+    PC.err = e.status === 401 ? 'Ключ Яндекс Диска недействителен — получите новый в настройках' : (e.message || String(e));
+    trace('ПК: ошибка ' + PC.err);
+  } finally {
+    PC.busy = false;
+    const r = route();
+    if (r.name === 'note') { const n = notes.find((x) => x.id === r.id); if (n && (n.pc || n.pcText)) { const st = $('#npc'); if (st) st.innerHTML = pcBoxHTML(n); bindPCBox(n); } }
+    clearTimeout(PC.timer);
+    // пока что-то ждёт компьютер — проверяем раз в 20 с, иначе раз в 2 мин (обновить «ПК в сети»)
+    if (pcOn() && !document.hidden) PC.timer = setTimeout(pcSync, notes.some(pcActive) ? 20000 : 120000);
+  }
+}
+function pcBoxHTML(n) {
+  const p = n.pc;
+  if (n.pcText && p?.state === 'ready') return `<div class="warnbox pcbox"><b>Готова расшифровка с компьютера</b>${p.model ? ' <span class="small">(' + esc(p.model) + ')</span>' : ''}. Вы правили текст после отправки, поэтому он не заменён.
+    <div class="btns" style="margin-top:8px"><button class="btn" data-pc="diff">Сравнить</button><button class="btn primary" data-pc="replace">Заменить</button><button class="btn" data-pc="append">Добавить ниже</button><button class="btn" data-pc="reject">Оставить мой</button></div></div>`;
+  if (!p) return '';
+  if (p.state === 'error') return `<div class="warnbox">Компьютер не смог распознать запись: ${esc(p.err || 'ошибка')}. <a data-pc="retry">Отправить ещё раз</a></div>`;
+  if (!pcActive(n)) return '';
+  const on = pcOnlineText();
+  const what = p.state === 'outbox' ? 'Ждёт отправки на Яндекс Диск (нет связи?).'
+    : PC.working?.has(n.id) ? 'Компьютер распознаёт запись…'
+    : on.on ? 'В очереди, компьютер в сети — скоро будет готово.' : `${on.text} Задание в очереди: расшифровка появится, когда он включится.`;
+  return `<div class="warnbox">🖥 ${esc(what)}${PC.err ? `<div class="small" style="margin-top:4px">Последняя ошибка: ${esc(PC.err)}</div>` : ''}
+    <div class="btns" style="margin-top:8px"><button class="btn" data-pc="check">Проверить сейчас</button><button class="btn" data-pc="cancel">Отменить</button></div></div>`;
+}
+function bindPCBox(n) {
+  app.querySelectorAll('[data-pc]').forEach((b) => (b.onclick = () => {
+    const a = b.dataset.pc;
+    if (a === 'diff') showDiff(n.text || '', n.pcText || '', 'Ваш текст ↔ компьютер');
+    else if (a === 'check') { toast('Проверяю…'); pcSync(); }
+    else if (a === 'cancel') cancelPC(n);
+    else if (a === 'retry') { n.pc = null; sendToPC(n); }
+    else resolvePC(n, a);
+  }));
+}
+function versionsHTML(n) {
+  if (!n.versions?.length) return '';
+  return `<details class="vers"><summary class="sec" style="cursor:pointer">Прежние варианты текста (${n.versions.length})</summary>
+    ${n.versions.map((v, i) => `<div class="card" style="margin-bottom:6px"><div class="meta" style="margin:0 0 4px"><b>${esc(v.label)}</b><span>${fmtDate(v.at)}</span></div>
+      <div class="s">${esc(v.text.slice(0, 200))}</div>
+      <div class="btns" style="margin-top:8px"><button class="btn" data-vdiff="${i}">Сравнить с текущим</button><button class="btn" data-vback="${i}">Вернуть</button></div></div>`).join('')}</details>`;
+}
+function bindVersions(n) {
+  app.querySelectorAll('[data-vdiff]').forEach((b) => (b.onclick = () => { const v = n.versions[+b.dataset.vdiff]; showDiff(n.text || '', v.text, `Текущий ↔ «${v.label}»`); }));
+  app.querySelectorAll('[data-vback]').forEach((b) => (b.onclick = () => {
+    const v = n.versions[+b.dataset.vback];
+    const cur = n.text; n.versions.splice(+b.dataset.vback, 1);
+    addVersion(n, 'Перед возвратом', cur); setText(n, v.text); saveNote(n); renderNote(n.id); toast('Текст возвращён');
+  }));
 }
 
 /* ================= Импорт аудиофайлов (голосовые из Telegram и т. п.) ================= */
@@ -549,9 +709,11 @@ async function importAudio(files) {
       segs.forEach((s, i) => enqueue(note, s.a, i));
       if (!segs.length) toast('В файле не найдено речи');
     }
+    if (S.pcAuto && pcOn()) note.pc = { state: 'outbox', sentAt: Date.now(), base: '' };
     saveNote(note);
     added++; last = note;
   }
+  if (added && S.pcAuto && pcOn()) pcSync();
   if (added === 1) location.hash = '#/n/' + last.id;
   else if (added) { toast(`Добавлено заметок: ${added}`); render(); }
 }
@@ -639,6 +801,7 @@ function renderList() {
   if (!list.length) { el.innerHTML = '<div class="empty">Ничего не найдено</div>'; return; }
   el.innerHTML = list.map((n) => {
     const st = n.status === 'transcribing' || n.status === 'recording' ? '<span>⏳ распознаётся</span>' : n.status === 'error' ? '<span style="color:var(--accent)">⚠︎ ошибка</span>' : '';
+    const pcs = pcActive(n) ? '<span>🖥 ждёт ПК</span>' : n.pc?.state === 'ready' ? '<span style="color:var(--warn)">🖥 готово, выберите</span>' : '';
     const links = linksOf(n).length;
     return `<a class="card" href="#/n/${encodeURIComponent(n.id)}">
       <div class="t">${esc(titleOf(n))}</div>
@@ -646,7 +809,7 @@ function renderList() {
       <div class="meta"><span>${fmtDate(n.createdAt)}</span>${n.source === 'file' ? '<span>📎 файл</span>' : ''}${n.duration ? `<span>${fmtDur(n.duration)}</span>` : ''}
         ${n.projectId ? `<span class="badge">${esc(projName(n.projectId) || '?')}</span>` : ''}
         ${tagsOf(n).slice(0, 4).map((t) => `<span class="tg">#${esc(t)}</span>`).join('')}
-        ${links ? `<span>🔗 ${links}</span>` : ''}${st}</div></a>`;
+        ${links ? `<span>🔗 ${links}</span>` : ''}${st}${pcs}</div></a>`;
   }).join('');
 }
 
@@ -670,7 +833,7 @@ function statusHTML(n) {
   if (n.recovered && n.status !== 'done') return `<div class="warnbox">Запись восстановлена после сбоя приложения (${fmtDur(n.duration)}). ${RETRY_HINT}</div>`;
   if (n.status === 'transcribing' || n.status === 'recording') return `<div class="warnbox">Распознавание было прервано (приложение закрывалось). ${n.hasAudio ? RETRY_HINT : ''}</div>`;
   if (n.status === 'error') return `<div class="warnbox">Часть записи не распознана. ${RETRY_HINT}</div>`;
-  if (n.source === 'file' && !n.text && IS_IOS) return `<div class="warnbox">Голосовое добавлено из файла, аудио ниже. Распознать файл на iPhone пока нельзя: встроенное распознавание Apple слушает только микрофон, а Whisper в Safari вылетает. Текст можно вписать в «Правке».</div>`;
+  if (n.source === 'file' && !n.text && IS_IOS) return `<div class="warnbox">Голосовое добавлено из файла, аудио ниже. Распознать файл на iPhone пока нельзя: встроенное распознавание Apple слушает только микрофон, а Whisper в Safari вылетает. Нажмите «🖥 Распознать на ПК» ниже или впишите текст в «Правке».</div>`;
   return '';
 }
 function renderNote(id) {
@@ -694,6 +857,7 @@ function renderNote(id) {
       <button class="chip tag" id="addtag">+ метка</button>
     </div>
     <div id="nstatus">${statusHTML(n)}</div>
+    <div id="npc">${pcBoxHTML(n)}</div>
     ${editMode && !busy ? `
       <div class="btns" style="margin:8px 0"><button class="btn" id="inslink">[[ ]] Связать</button><button class="btn" id="instag"># Метка</button></div>
       <textarea class="field" id="ntext" placeholder="Текст заметки. #метки и [[ссылки на другие заметки]] работают прямо в тексте.">${esc(n.text || '')}</textarea>`
@@ -701,9 +865,11 @@ function renderNote(id) {
     ${outgoing.length ? `<div class="sec">Связи из заметки</div><div class="chips" style="flex-wrap:wrap">${outgoing.map((l) => `<button class="chip" data-link="${esc(l)}">🔗 ${esc(l)}</button>`).join('')}</div>` : ''}
     <div class="sec">Ссылаются сюда</div>
     ${backlinks.length ? backlinks.map((b) => `<a class="card" href="#/n/${encodeURIComponent(b.id)}" style="margin-bottom:6px"><div class="t">${esc(titleOf(b))}</div><div class="meta">${fmtDate(b.createdAt)}</div></a>`).join('') : '<div class="small">Пока никто. Напишите [[' + esc(titleOf(n)) + ']] в другой заметке.</div>'}
+    ${versionsHTML(n)}
     <div class="sec">Аудио</div>
     <div id="naudio" class="small">${n.hasAudio ? 'Загрузка…' : 'Не сохранено'}</div>
     <div class="btns" style="margin-top:10px">
+      ${n.hasAudio && !pcActive(n) && n.pc?.state !== 'ready' ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
       ${n.hasAudio && !IS_IOS ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
       <button class="btn danger" id="del">Удалить</button>
     </div>
@@ -729,6 +895,8 @@ function renderNote(id) {
   app.querySelectorAll('[data-rmtag]').forEach((b) => (b.onclick = () => { n.tags = n.tags.filter((t) => t !== b.dataset.rmtag); saveNote(n); renderNote(id); }));
   bindTextLinks(app);
   const rt = $('#retr'); if (rt) rt.onclick = () => retranscribe(n);
+  const tp = $('#topc'); if (tp) tp.onclick = () => sendToPC(n);
+  bindPCBox(n); bindVersions(n);
   $('#del').onclick = async () => {
     if (!confirm('Удалить заметку безвозвратно?')) return;
     notes = notes.filter((x) => x.id !== n.id); jobs.delete(n.id);
@@ -858,6 +1026,9 @@ async function renderSettings() {
     ${segBtn('autoload', [[true, 'Грузить модель при запуске'], [false, 'Только при записи']])}
     <div style="height:8px"></div>${segBtn('keepAudio', [[true, 'Хранить аудио'], [false, 'Только текст']])}
 
+    <div class="sec">Распознавание на компьютере</div>
+    <div id="pcset">${pcSettingsHTML()}</div>
+
     <div class="sec">Экспорт и резервная копия</div>
     <div class="btns">
       <button class="btn" id="exmd">Markdown (.zip) для Obsidian</button>
@@ -875,7 +1046,7 @@ async function renderSettings() {
       <pre class="small" id="vlog" style="white-space:pre-wrap;user-select:text;margin:8px 0">${esc(ls.get('vn.log', []).join('\n') || 'пусто')}</pre>
       <button class="btn" id="cplog">Скопировать журнал</button>
     </details>
-    <div class="small" style="margin-top:24px">Всё хранится только на этом устройстве. Распознавание идёт локально, интернет нужен только для первой загрузки модели.</div>
+    <div class="small" style="margin-top:24px">Всё хранится только на этом устройстве. Распознавание идёт локально, интернет нужен только для первой загрузки модели. Исключение — «Распознавание на компьютере»: аудио этих заметок проходит через ваш Яндекс Диск.</div>
   </main>`;
   asrUI();
   app.querySelectorAll('[data-model]').forEach((b) => (b.onclick = () => {
@@ -892,6 +1063,7 @@ async function renderSettings() {
     renderSettings();
   }));
   $('#loadm').onclick = () => ASR.load();
+  bindPCSettings();
   $('#updchk').onclick = () => checkUpdate(true);
   $('#cplog').onclick = async () => {
     const t = `v${VERSION} ${navigator.userAgent}\n` + ls.get('vn.log', []).join('\n');
@@ -907,6 +1079,54 @@ async function renderSettings() {
     Object.keys(MODELS).forEach((m) => ls.set('vn.dl.' + m, false));
     toast('Модели удалены'); renderSettings();
   };
+}
+
+function pcSettingsHTML() {
+  const cid = ls.get('vn.ydClient', '');
+  if (!pcOn()) return `<div class="small">Запись уходит в папку приложения на вашем Яндекс Диске, программа на компьютере распознаёт её моделью Whisper large и кладёт текст обратно. Если компьютер выключен, задание ждёт. Подробная инструкция — в папке <b>pc-agent</b> проекта.</div>
+    <div class="small" style="margin:10px 0 4px">1. ClientID приложения Яндекса (oauth.yandex.ru):</div>
+    <input class="field" id="ydcid" placeholder="например, 0123456789abcdef…" value="${esc(cid)}" autocomplete="off">
+    <div class="btns" style="margin-top:8px"><button class="btn" id="ydget">2. Получить ключ</button></div>
+    <div class="small" style="margin:10px 0 4px">3. Вставьте ключ, который показал Яндекс:</div>
+    <input class="field" id="ydtok" placeholder="y0_…" autocomplete="off">
+    <div class="btns" style="margin-top:8px"><button class="btn primary" id="ydsave">Подключить</button></div>`;
+  const on = pcOnlineText();
+  return `<div class="status"><span class="dot ${on.on ? 'ok' : 'warn'}"></span>${esc(on.text)}</div>
+    <div class="small" id="ydwho" style="margin-top:4px">Яндекс Диск подключён.${PC.err ? ' Последняя ошибка: ' + esc(PC.err) : ''}</div>
+    <div style="height:10px"></div>${'<div class="seg">' + [[false, 'Только по кнопке'], [true, 'Все новые записи']].map(([v, l]) => `<button data-k="pcAuto" data-v="${v}" class="${S.pcAuto === v ? 'on' : ''}">${l}</button>`).join('') + '</div>'}
+    <div class="small" style="margin-top:6px">«Все новые записи» — каждая запись и импортированный файл сами уходят на компьютер. Текст, который вы успели исправить, не заменяется: появится плашка с выбором.</div>
+    <div class="btns" style="margin-top:10px"><button class="btn" id="ydtest">Проверить связь</button><button class="btn" id="ydcopy">Скопировать ключ для ПК</button><button class="btn danger" id="ydoff">Отключить</button></div>
+    <div class="small" id="ydmsg" style="margin-top:6px"></div>`;
+}
+function bindPCSettings() {
+  const g = $('#ydget');
+  if (g) g.onclick = () => {
+    const cid = $('#ydcid').value.trim(); if (!cid) { toast('Сначала вставьте ClientID'); return; }
+    ls.set('vn.ydClient', cid);
+    window.open('https://oauth.yandex.ru/authorize?response_type=token&client_id=' + encodeURIComponent(cid), '_blank');
+  };
+  const sv = $('#ydsave');
+  if (sv) sv.onclick = async () => {
+    const t = $('#ydtok').value.trim().replace(/^.*access_token=([^&]+).*$/, '$1'); if (!t) { toast('Вставьте ключ'); return; }
+    try { const i = await new YDisk(t, ls.get('vn.ydApi', API)).info(); ls.set('vn.ydToken', t); trace('ПК: Диск подключён ' + (i?.user?.login || '')); toast('Яндекс Диск подключён'); PC.dirsOk = false; pcSync(); renderSettings(); }
+    catch (e) { toast('Ключ не подошёл: ' + (e.message || e), 5000); }
+  };
+  const tst = $('#ydtest');
+  if (tst) tst.onclick = async () => {
+    const msg = $('#ydmsg'), d = PC.disk(), say = (t) => { msg.textContent = t; trace('ПК: проверка — ' + t); };
+    try {
+      say('Проверяю доступ…'); const i = await d.info();
+      say('Загрузка…'); const probe = 'проверка ' + Date.now(); await d.upload('app:/probe.txt', new Blob([probe]));
+      say('Скачивание…'); const back = await d.download('app:/probe.txt'); await d.remove('app:/probe.txt');
+      if (back !== probe) throw new Error('файл вернулся не таким');
+      await pcSync();
+      say(`Всё работает: Диск ${i?.user?.login || ''}, загрузка и скачивание из браузера проходят. ${pcOnlineText().text}`);
+    } catch (e) { say('Ошибка: ' + (e.message || e) + '. Скопируйте журнал (внизу) и пришлите разработчику.'); }
+  };
+  const cp = $('#ydcopy');
+  if (cp) cp.onclick = async () => { try { await navigator.clipboard.writeText(PC.token()); toast('Ключ скопирован — вставьте его в программу на ПК'); } catch { prompt('Скопируйте ключ:', PC.token()); } };
+  const off = $('#ydoff');
+  if (off) off.onclick = () => { if (!confirm('Отключить Яндекс Диск? Задания в очереди останутся на Диске.')) return; ls.set('vn.ydToken', ''); renderSettings(); };
 }
 
 /* ================= Экспорт ================= */
@@ -1009,11 +1229,16 @@ async function importJSON(e) {
     await DB.put('notes', n);
   }
 
+  // ключ Яндекс Диска, если вход делали прямо в этом браузере (страница вернулась с #access_token=…)
+  const tok = location.hash.match(/access_token=([^&]+)/);
+  if (tok) { ls.set('vn.ydToken', decodeURIComponent(tok[1])); history.replaceState(null, '', location.pathname + '#/settings'); toast('Яндекс Диск подключён'); }
+
   render();
+  pcSync();
   if (!useSys() && S.autoload && ls.get('vn.dl.' + S.model, false) && !crashNote) ASR.load();
 })();
 addEventListener('pagehide', () => markAlive(false));
-document.addEventListener('visibilitychange', () => { markAlive(!document.hidden); if (!document.hidden) checkUpdate(false); });
+document.addEventListener('visibilitychange', () => { markAlive(!document.hidden); if (!document.hidden) { checkUpdate(false); pcSync(); } });
 setTimeout(() => checkUpdate(false), 3000);
 // Предупреждение, если закрывают во время записи
 addEventListener('pagehide', () => { if (rec) stopRecording(); });

@@ -1,0 +1,6 @@
+@echo off
+chcp 65001 >nul
+copy /y "%~dp0vn_agent.py" "%LOCALAPPDATA%\voice-notes-agent\vn_agent.py" >nul
+powershell -NoProfile -Command "Stop-ScheduledTask -TaskName 'VoiceNotesAgent' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName 'VoiceNotesAgent'"
+echo Программа перезапущена (и обновлена из этой папки).
+timeout /t 3 >nul
