@@ -1083,7 +1083,7 @@ async function renderSettings() {
 
 function pcSettingsHTML() {
   const cid = ls.get('vn.ydClient', '');
-  if (!pcOn()) return `<div class="small">Запись уходит в папку приложения на вашем Яндекс Диске, программа на компьютере распознаёт её моделью Whisper large и кладёт текст обратно. Если компьютер выключен, задание ждёт. Подробная инструкция — в папке <b>pc-agent</b> проекта.</div>
+  if (!pcOn()) return `<div class="small">Запись уходит в папку приложения на вашем Яндекс Диске, программа на компьютере распознаёт её моделью Whisper large и кладёт текст обратно. Если компьютер выключен, задание ждёт. Инструкция — файл README.txt в архиве pc-agent.</div>
     <div class="small" style="margin:10px 0 4px">1. ClientID приложения Яндекса (oauth.yandex.ru):</div>
     <input class="field" id="ydcid" placeholder="например, 0123456789abcdef…" value="${esc(cid)}" autocomplete="off">
     <div class="btns" style="margin-top:8px"><button class="btn" id="ydget">2. Получить ключ</button></div>
