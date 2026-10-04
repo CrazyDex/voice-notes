@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.9';
+import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.10';
 import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.5';
 
 /* ================= Настройки ================= */
@@ -18,13 +18,14 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.9';
+const VERSION = '1.10';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
 // v0.7: Whisper в Safari на iPhone вылетает при распознавании — переводим на встроенное распознавание
 if (IS_IOS && SR && !ls.get('vn.mig07', false)) { S.engine = 'sys'; ls.set('vn.mig07', true); saveS(); }
 if (!SR) S.engine = 'whisper';
+try { localStorage.removeItem('vn.sysNoRec'); } catch {}
 const useSys = () => S.engine === 'sys' && !!SR;
 // Whisper в Safari на iPhone падает во время распознавания — там его не предлагаем
 const RETRY_HINT = IS_IOS ? 'Аудио сохранено, его можно прослушать ниже.' : 'Нажмите «Перераспознать».';
@@ -478,7 +479,7 @@ async function startRecording(target) {
   const sys = useSys();
   trace('запись: нажата кнопка' + (sys ? ' (встроенное распознавание)' : '') + (clip ? ' · дозапись в заметку' : ''));
   // если встроенное распознавание не уживается с нашей записью звука — пишем только текст
-  rec = sys && ls.get('vn.sysNoRec', false) ? new NullRecorder() : new Recorder();
+  rec = new Recorder(); // звук пишем всегда (раньше флаг vn.sysNoRec навсегда отключал его)
   segIndex = 0;
   try {
     // сначала микрофон, потом распознавание: пока наш поток открыт, Safari не спрашивает разрешение
@@ -682,11 +683,8 @@ const Sys = {
         try { this.r.abort(); } catch {}
         return;
       }
-      if (!(rec instanceof NullRecorder)) {
-        trace('встроенное: всё ещё не слышит — отдаю микрофон распознаванию, звук дальше не пишется');
-        const old = rec; rec = new NullRecorder(old.seconds); rec.start(); old.stop().catch(() => {}).finally(() => releaseMic(true));
-        try { this.r.abort(); } catch {}
-      }
+      // звук не трогаем ни при каких условиях: он сохранится и его можно распознать на ПК
+      trace('встроенное: так и не слышит — текст будет пустым, звук сохраняется');
       clearInterval(this.dog);
     }, 1000);
   },
@@ -715,11 +713,10 @@ const Sys = {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         this.on = false; this.err = 'нет разрешения';
         toast('Распознавание речи запрещено. Включите Siri и Диктовку: Настройки iPhone → Основные → Клавиатура → «Включить диктовку».', 7000);
-      } else if (e.error === 'audio-capture' && rec && !(rec instanceof NullRecorder)) {
-        // микрофон занят нашей записью звука: дальше пишем только текст
-        ls.set('vn.sysNoRec', true);
-        trace('встроенное: отключаю запись звука, чтобы освободить микрофон');
-        const old = rec; rec = new NullRecorder(old.seconds); rec.start(); old.stop().catch(() => {}).finally(() => releaseMic(true));
+      } else if (e.error === 'audio-capture') {
+        // раньше здесь навсегда выключалась запись звука — из-за этого пропадало аудио. Теперь звук пишется
+        // дальше, а распознавание само перезапустится (onend), см. счётчик quick
+        this.err = 'микрофон занят';
       } else if (e.error !== 'no-speech' && e.error !== 'aborted') this.err = e.error;
     };
     r.onend = () => {
@@ -1061,7 +1058,7 @@ async function startStream(s) {
   if ((s.frags || []).some((f) => f.pending)) { toast('Дождитесь окончания распознавания'); return; }
   const sys = useSys();
   trace('поток: запись' + (sys ? ' (встроенное)' : ''));
-  rec = sys && ls.get('vn.sysNoRec', false) ? new NullRecorder() : new Recorder();
+  rec = new Recorder(); // звук пишем всегда (раньше флаг vn.sysNoRec навсегда отключал его)
   recStream = s;
   try {
     await rec.start({

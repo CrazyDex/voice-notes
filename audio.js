@@ -110,13 +110,20 @@ export function releaseMic(now = false) {
 
 export class Recorder {
   async start({ onSegment, segOpts, log = () => {} }) {
+    this.log = log;
     this.stream = await getMic(log);
+    this.watch(this.stream);
     const AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC();
     await this.ctx.resume();
     log(`запись: аудио ${this.ctx.sampleRate} Гц`);
     const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
     await this.ctx.audioWorklet.addModule(url);
+    // iOS при подключении/отключении наушников может «прервать» аудио — возобновляем
+    this.ctx.onstatechange = () => {
+      log('запись: аудио ' + this.ctx.state);
+      if (!this.stopped && this.ctx.state !== 'running' && this.ctx.state !== 'closed') this.ctx.resume().catch(() => {});
+    };
     this.src = this.ctx.createMediaStreamSource(this.stream);
     log('запись: обработчик звука загружен');
     this.node = new AudioWorkletNode(this.ctx, 'cap');
@@ -134,6 +141,31 @@ export class Recorder {
     };
     this.t0 = Date.now();
   }
+  // Смена микрофона (наушники сняли/надели) может завершить дорожку — тогда открываем микрофон заново
+  // и подключаем новый поток к тому же обработчику, запись продолжается в тот же файл
+  watch(stream) {
+    for (const t of stream.getAudioTracks()) {
+      t.onmute = () => this.log('запись: микрофон приглушён системой');
+      t.onunmute = () => this.log('запись: микрофон снова слышно');
+      t.onended = () => { if (!this.stopped) this.reopen(); };
+    }
+  }
+  async reopen() {
+    if (this.reopening || this.stopped) return;
+    this.reopening = true;
+    this.log('запись: микрофон отключился (смена наушников?), открываю заново');
+    try {
+      const st = await getMic(this.log);
+      if (this.stopped) return;
+      try { this.src.disconnect(); } catch {}
+      this.stream = st; this.watch(st);
+      this.src = this.ctx.createMediaStreamSource(st);
+      this.src.connect(this.node);
+      if (this.ctx.state !== 'running') await this.ctx.resume().catch(() => {});
+      this.log('запись: микрофон снова подключён');
+    } catch (e) { this.log('запись: не удалось открыть микрофон заново ' + (e?.name || e)); }
+    finally { this.reopening = false; }
+  }
   get level() { return this.seg ? this.seg.level : 0; }
   get voicedSec() { return this.seg ? this.seg.voiced / 50 : 0; }
   // новые сэмплы с прошлого вызова — для автосохранения записи кусками
@@ -149,6 +181,7 @@ export class Recorder {
   // принудительно закончить текущий кусок (кнопка «Следующая мысль»): он сразу уходит в onSegment
   cut() { try { this.seg?.flush(); } catch {} }
   async stop() {
+    this.stopped = true;
     try { this.node.port.onmessage = null; this.src.disconnect(); this.node.disconnect(); } catch {}
     releaseMic();
     try { await this.ctx.close(); } catch {}
