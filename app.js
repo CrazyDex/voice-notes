@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.7';
+import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.8';
 import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.5';
 
 /* ================= Настройки ================= */
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.7';
+const VERSION = '1.8';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -122,6 +122,7 @@ function wordsOf(text) {
   const skip = [];
   for (const m of text.matchAll(LINK_RE)) skip.push([m.index, m.index + m[0].length]);
   for (const m of text.matchAll(TAG_RE)) skip.push([m.index, m.index + m[0].length]);
+  for (const m of text.matchAll(/^#{1,6} .*$/gm)) skip.push([m.index, m.index + m[0].length]); // заголовки «🎙 дата»
   const out = [];
   for (const m of text.matchAll(WORD_RE)) {
     const w = m[0], i = m.index;
@@ -204,6 +205,18 @@ function saveNote(n, delay = 0) {
   saveTimers[n.id] = setTimeout(() => DB.put('notes', n).catch((e) => toast('Ошибка сохранения: ' + e)), delay);
 }
 
+// Весь текст заметки одной кнопкой: без разметки ### и с подписями ссылок вместо [[…]]
+function plainText(n) {
+  return (n.text || '').replace(/^#{1,6} /gm, '').replace(LINK_RE, (_, x) => linkParts(x).label).trim();
+}
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); return true; } catch {}
+  // запасной путь для старых браузеров
+  const ta = document.createElement('textarea'); ta.value = t; ta.setAttribute('readonly', ''); ta.style.cssText = 'position:fixed;top:0;opacity:0';
+  document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, t.length);
+  let ok = false; try { ok = document.execCommand('copy'); } catch {}
+  ta.remove(); return ok;
+}
 function toast(msg, ms = 2600) {
   const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
   document.body.appendChild(t); setTimeout(() => t.remove(), ms);
@@ -404,6 +417,19 @@ function setClipBody(n, r, body) {
   const t = n.text || '', rest = t.slice(r.b);
   setText(n, t.slice(0, r.a) + '\n' + body.trim() + (rest ? '\n\n' + rest : ''));
 }
+// Первая запись заметки тоже начинается с заголовка «### 🎙 дата» (note.head) — единый вид журнала.
+// Её раздел — от начала (после заголовка) до первой дозаписи; расшифровка с ПК меняет только его.
+function mainRange(n) {
+  const t = n.text || '';
+  const a = n.head && t.startsWith(n.head) ? n.head.length : 0;
+  let b = t.length;
+  for (const c of n.clips || []) { if (!c.head) continue; const i = t.indexOf(c.head, a); if (i >= 0 && i < b) b = i; }
+  return { a, b, body: t.slice(a, b).trim() };
+}
+function setMainBody(n, r, body) {
+  const t = n.text || '', rest = t.slice(r.b);
+  setText(n, (t.slice(0, r.a) + (r.a ? '\n' : '') + body.trim() + (rest ? '\n\n' + rest : '')).trim());
+}
 const clipTime = (c) => new Date(c.at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
 /* ================= Запись ================= */
@@ -443,6 +469,8 @@ async function startRecording(target) {
       tags: [], projectId: filter.project && filter.project !== 'none' ? filter.project : null, status: 'recording',
     };
     if (filter.tag) note.tags.push(filter.tag);
+    note.head = clipHead(note, note.createdAt);
+    note.prefix = note.head + '\n';
   }
   const recKey = clip ? clipKey(note, clip) : note.id;
   const sys = useSys();
@@ -511,7 +539,7 @@ async function stopRecording() {
   note.parts = 0;
   note.status = jobs.has(note.id) ? 'transcribing' : 'done';
   finishIfDone(note);
-  if (S.pcAuto && pcOn() && holder.hasAudio) holder.pc = { state: 'outbox', sentAt: Date.now(), base: clip ? clipRange(note, clip)?.body || '' : note.text || '' };
+  if (S.pcAuto && pcOn() && holder.hasAudio) holder.pc = { state: 'outbox', sentAt: Date.now(), base: clip ? clipRange(note, clip)?.body || '' : mainRange(note).body };
   saveNote(note);
   if (holder.pc) pcSync();
   $('.rec')?.remove();
@@ -694,7 +722,8 @@ async function retranscribe(note) {
   const pcm = await decodeWav(blob);
   const segs = segmentAll(pcm, { minSec: 3, maxSec: S.segMax, silenceMs: 500 });
   addVersion(note, 'До перераспознавания', note.text);
-  note.segTexts = []; note.prefix = ''; note.text = ''; note.status = 'transcribing';
+  const keepHead = note.head && (note.text || '').startsWith(note.head);
+  note.segTexts = []; note.prefix = keepHead ? note.head + '\n' : ''; note.text = keepHead ? note.head : ''; note.status = 'transcribing';
   jobs.delete(note.id);
   if (!segs.length) { note.status = 'done'; toast('В записи не найдено речи'); }
   segs.forEach((s, i) => enqueue(note, s.a, i));
@@ -747,7 +776,7 @@ async function sendToPC(n, quiet, c) {
   if (!o.hasAudio) { toast('У заметки нет аудио'); return; }
   if (pcActive(o)) { toast('Уже в очереди на компьютер'); return; }
   if (o.pc?.state === 'ready') { toast('Расшифровка с ПК уже готова — выберите, что с ней сделать'); return; }
-  o.pc = { state: 'outbox', sentAt: Date.now(), base: c ? clipRange(n, c)?.body || '' : n.text || '' };
+  o.pc = { state: 'outbox', sentAt: Date.now(), base: c ? clipRange(n, c)?.body || '' : mainRange(n).body };
   trace('ПК: в очередь ' + (c ? clipKey(n, c) : n.id));
   saveNote(n); onNoteChanged(n);
   if (!quiet) toast(pcOnlineText().on ? 'Отправляю на компьютер…' : 'Компьютер выключен — задание будет ждать в очереди');
@@ -763,9 +792,10 @@ function applyPCResult(n, res) {
   if (res.error) { n.pc = { ...n.pc, state: 'error', err: res.error }; return 'error'; }
   const text = (res.text || '').trim();
   const editing = $('#ntext') && lastNoteId === n.id;
-  const untouched = !editing && (n.text || '').trim() === (n.pc?.base || '').trim();
+  const r = mainRange(n);
+  const untouched = !editing && r.body === (n.pc?.base || '').trim();
   n.pc = { ...n.pc, state: untouched ? 'done' : 'ready', model: res.model, device: res.device, doneAt: Date.now() };
-  if (untouched) { addVersion(n, 'До компьютера', n.text); setText(n, text); delete n.pcText; if (n.status !== 'recording') n.status = 'done'; return 'replaced'; }
+  if (untouched) { addVersion(n, 'До компьютера', n.text); setMainBody(n, r, text); delete n.pcText; if (n.status !== 'recording') n.status = 'done'; return 'replaced'; }
   n.pcText = text; return 'ready';
 }
 // То же для записи журнала: заменяется только её раздел и только если его не правили после отправки
@@ -791,8 +821,10 @@ function resolveClipPC(n, c, how) {
 }
 function resolvePC(n, how) {
   const t = n.pcText || '';
-  if (how === 'replace') { addVersion(n, 'Мой текст', n.text); setText(n, t); }
-  else if (how === 'append') { setText(n, (n.text || '').trimEnd() + '\n\n— Расшифровка с компьютера —\n' + t); }
+  const r = mainRange(n);
+  // заменяется только раздел первой записи — дозаписи журнала остаются на месте
+  if (how === 'replace') { addVersion(n, 'Мой текст', n.text); setMainBody(n, r, t); }
+  else if (how === 'append') setMainBody(n, r, r.body + '\n\n— Расшифровка с компьютера —\n' + t);
   else addVersion(n, 'С компьютера', t);
   delete n.pcText; n.pc = { ...n.pc, state: 'done' };
   saveNote(n); renderNote(n.id);
@@ -884,7 +916,7 @@ function bindPCBox(n) {
       if (a === 'diff') showDiff(clipRange(n, c)?.body || '', c.pcText || '', `Запись ${clipTime(c)} ↔ компьютер`);
       else resolveClipPC(n, c, a);
     }
-    else if (a === 'diff') showDiff(n.text || '', n.pcText || '', 'Ваш текст ↔ компьютер');
+    else if (a === 'diff') showDiff(mainRange(n).body, n.pcText || '', 'Ваш текст ↔ компьютер');
     else resolvePC(n, a);
   }));
 }
@@ -925,6 +957,7 @@ async function importAudio(files) {
       tags: filter.tag ? [filter.tag] : [], projectId: filter.project && filter.project !== 'none' ? filter.project : null,
       status: 'done', source: 'file', fileName: f.name, duration: pcm.length / 16000, hasAudio: true,
     };
+    note.head = clipHead(note, note.createdAt); note.prefix = note.head + '\n'; note.text = note.head;
     await DB.put('audio', encodeWav(pcm), note.id);
     notes.unshift(note);
     if (canTranscribeFile()) {
@@ -932,7 +965,7 @@ async function importAudio(files) {
       segs.forEach((s, i) => enqueue(note, s.a, i));
       if (!segs.length) toast('В файле не найдено речи');
     }
-    if (S.pcAuto && pcOn()) note.pc = { state: 'outbox', sentAt: Date.now(), base: '' };
+    if (S.pcAuto && pcOn()) note.pc = { state: 'outbox', sentAt: Date.now(), base: mainRange(note).body };
     saveNote(note);
     added++; last = note;
   }
@@ -1029,7 +1062,7 @@ function renderList() {
     const links = linksOf(n).length;
     return `<a class="card" href="#/n/${encodeURIComponent(n.id)}">
       <div class="t">${esc(titleOf(n))}</div>
-      <div class="s">${esc((n.text || '').replace(/^#{1,6} /gm, '').slice(0, 220)) || '<i>без текста</i>'}</div>
+      <div class="s">${esc((n.text || '').replace(/^#{1,6} .*$/gm, '').trim().slice(0, 220)) || '<i>без текста</i>'}</div>
       <div class="meta"><span>${fmtDate(n.createdAt)}</span>${n.source === 'file' ? '<span>📎 файл</span>' : ''}${n.duration ? `<span>${fmtDur(n.duration)}</span>` : ''}${nc ? `<span>🎙 ${nc}</span>` : ''}
         ${n.projectId ? `<span class="badge">${esc(projName(n.projectId) || '?')}</span>` : ''}
         ${tagsOf(n).slice(0, 4).map((t) => `<span class="tg">#${esc(t)}</span>`).join('')}
@@ -1060,7 +1093,7 @@ function statusHTML(n) {
   if (n.recovered && n.status !== 'done') return `<div class="warnbox">Запись восстановлена после сбоя приложения (${fmtDur(n.duration)}). ${RETRY_HINT}</div>`;
   if (n.status === 'transcribing' || n.status === 'recording') return `<div class="warnbox">Распознавание было прервано (приложение закрывалось). ${n.hasAudio ? RETRY_HINT : ''}</div>`;
   if (n.status === 'error') return `<div class="warnbox">Часть записи не распознана. ${RETRY_HINT}</div>`;
-  if (n.source === 'file' && !n.text && IS_IOS && !(n.clips || []).length) return `<div class="warnbox">Голосовое добавлено из файла, аудио ниже. Распознать файл на iPhone пока нельзя: встроенное распознавание Apple слушает только микрофон, а Whisper в Safari вылетает. Нажмите «🖥 Распознать на ПК» ниже или впишите текст в «Правке».</div>`;
+  if (n.source === 'file' && !mainRange(n).body && IS_IOS && !(n.clips || []).length) return `<div class="warnbox">Голосовое добавлено из файла, аудио ниже. Распознать файл на iPhone пока нельзя: встроенное распознавание Apple слушает только микрофон, а Whisper в Safari вылетает. Нажмите «🖥 Распознать на ПК» ниже или впишите текст в «Правке».</div>`;
   return '';
 }
 function renderNote(id) {
@@ -1100,7 +1133,7 @@ function renderNote(id) {
     <div class="btns" style="margin-top:10px">
       ${n.hasAudio && !pcActive(n) && n.pc?.state !== 'ready' ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
       ${n.hasAudio && !IS_IOS && !clips.length ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
-      ${clips.length ? '' : '<button class="btn danger" id="del">Удалить</button>'}
+      ${clips.length ? '' : '<button class="btn" id="ncopy">📋 Скопировать весь текст</button><button class="btn danger" id="del">Удалить</button>'}
     </div>
     ${clips.map((c) => `<div class="card" style="margin-top:10px" data-clip="${c.id}">
       <div class="meta" style="margin:0 0 4px"><b>🎙 ${esc(clipTime(c))}</b>${c.duration ? `<span>${fmtDur(c.duration)}</span>` : ''}${clipRange(n, c) ? '' : '<span>раздел в тексте удалён</span>'}</div>
@@ -1110,7 +1143,7 @@ function renderNote(id) {
         ${c.hasAudio && !pcActive(c) && c.pc?.state !== 'ready' ? `<button class="btn" data-ctopc="${c.id}">🖥 Распознать на ПК</button>` : ''}
         <button class="btn danger" data-cdel="${c.id}">Удалить аудио</button>
       </div></div>`).join('')}
-    ${clips.length ? '<div class="btns" style="margin-top:14px"><button class="btn danger" id="del">Удалить заметку</button></div>' : ''}
+    ${clips.length ? '<div class="btns" style="margin-top:14px"><button class="btn" id="ncopy">📋 Скопировать весь текст</button><button class="btn danger" id="del">Удалить заметку</button></div>' : ''}
   </main>
   ${busy || n.status === 'recording' ? '' : `<button class="fab" id="nfab" aria-label="Дописать голосом" title="Дописать голосом">${I.mic}</button>`}`;
 
@@ -1157,6 +1190,12 @@ function renderNote(id) {
   const rt = $('#retr'); if (rt) rt.onclick = () => retranscribe(n);
   const tp = $('#topc'); if (tp) tp.onclick = () => sendToPC(n);
   bindPCBox(n); bindVersions(n);
+  $('#ncopy').onclick = async () => {
+    const ta2 = $('#ntext'); if (ta2) n.text = ta2.value;
+    const t = plainText(n);
+    if (!t) { toast('Текста пока нет'); return; }
+    toast(await copyText(t) ? 'Текст скопирован' : 'Не удалось скопировать');
+  };
   $('#del').onclick = async () => {
     if (!confirm('Удалить заметку безвозвратно?')) return;
     notes = notes.filter((x) => x.id !== n.id); jobs.delete(n.id);
