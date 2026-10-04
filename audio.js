@@ -146,6 +146,8 @@ export class Recorder {
     return out;
   }
   get seconds() { return (this.samples || 0) / 16000; }
+  // принудительно закончить текущий кусок (кнопка «Следующая мысль»): он сразу уходит в onSegment
+  cut() { try { this.seg?.flush(); } catch {} }
   async stop() {
     try { this.node.port.onmessage = null; this.src.disconnect(); this.node.disconnect(); } catch {}
     releaseMic();
@@ -166,6 +168,7 @@ export class NullRecorder {
   get voicedSec() { return 0; }
   get seconds() { return this.offset + (this.t0 ? (Date.now() - this.t0) / 1000 : 0); }
   takeNew() { return new Float32Array(0); }
+  cut() {}
   async stop() { return new Float32Array(0); }
 }
 

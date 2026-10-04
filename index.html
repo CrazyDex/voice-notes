@@ -67,6 +67,14 @@ h1{font-size:26px;margin:4px 0 8px;letter-spacing:-.02em}
 .live .pend{color:var(--muted)}
 .stopbtn{width:84px;height:84px;border-radius:50%;background:var(--accent);margin:0 auto;display:grid;place-items:center}
 .stopbtn i{width:30px;height:30px;border-radius:7px;background:#fff;display:block}
+/* поток */
+.nextbtn{width:100%;padding:18px;font-size:19px;border-radius:16px;margin-bottom:14px}
+.live .lf{padding:8px 0;border-bottom:1px solid var(--surface2)}
+.live .lf:last-child{border-bottom:0}
+.live .lf.cur{color:var(--text)}
+.frag.new{box-shadow:inset 3px 0 0 var(--accent),var(--shadow)}
+.frag{scroll-margin-top:80px}
+.frag .ftext{white-space:pre-wrap;font-size:16px;line-height:1.45}
 .small{font-size:13px;color:var(--muted)}
 .center{text-align:center}
 /* заметка */
@@ -104,7 +112,7 @@ audio{width:100%;margin-top:6px}
 </head>
 <body>
 <div id="app"></div>
-<script type="module" src="app.js?v=1.8"></script>
+<script type="module" src="app.js?v=1.9"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

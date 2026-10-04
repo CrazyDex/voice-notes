@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.8';
+import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.9';
 import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.5';
 
 /* ================= Настройки ================= */
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.8';
+const VERSION = '1.9';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -262,6 +262,7 @@ const I = {
   gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
   back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>',
   file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 18v-6M9 15l3 3 3-3"/></svg>',
+  wave: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 7c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 6 0M2 12c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 6 0M2 17c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 6 0"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
 };
 
@@ -448,6 +449,7 @@ function recInfo() {
 // target — существующая заметка: запись дописывается в неё новым разделом (журнал), а не создаёт новую
 async function startRecording(target) {
   if (rec) return;
+  if (target?.stream) return startStream(target);
   let note, clip = null, undo = null;
   if (target && target.id) {
     if (jobs.has(target.id) || target.status === 'transcribing' || target.status === 'recording') { toast('Дождитесь окончания распознавания'); return; }
@@ -521,6 +523,7 @@ let recSaver = null;
 
 async function stopRecording() {
   if (!rec) return;
+  if (recStream) return stopStream();
   clearInterval(recTimer); clearInterval(recSaver);
   const r = rec; rec = null;
   trace('запись: стоп');
@@ -599,6 +602,8 @@ function onNoteChanged(note) {
   if (recNote && note.id === recNote.id) updateRecLive();
   const r = route();
   if (r.name === 'note' && r.id === note.id) updateNoteDyn(note);
+  else if (r.name === 'stream' && r.id === note.id) { if (!$('[data-fedit]') && !$('audio')) { const keep = scrollY; renderStream(note.id); scrollTo(0, keep); } }
+  else if (r.name === 'streams') renderStreams();
   else if (r.name === 'home') renderList();
   asrUI();
 }
@@ -636,9 +641,33 @@ function punctuate(t, final) {
 
 const Sys = {
   r: null, on: false, done: [], cur: '', note: null, err: '', quick: 0, endWait: null,
+  // Поток: onText — вместо записи в заметку; cuts — номера в done, с которых начинается следующая мысль
+  onText: null, cuts: [], cutPending: false,
   texts() { return [...this.done.map((t) => punctuate(t, true)), punctuate(this.cur, false)].filter(Boolean); },
+  // текст по мыслям: [мысль 1, мысль 2, …]; пока разрез ещё не случился, текущая фраза относится к прежней мысли
+  groups() {
+    const out = []; let from = 0;
+    for (let k = 0; k <= this.cuts.length; k++) {
+      const to = k < this.cuts.length ? this.cuts[k] : this.done.length;
+      out.push(this.done.slice(from, to).map((t) => punctuate(t, true)).filter(Boolean));
+      from = to;
+    }
+    if (this.cur) out[out.length - 1].push(punctuate(this.cur, false));
+    return out.map((a) => a.join(' '));
+  },
+  // «Следующая мысль»: просим Safari дораспознать сказанное и закончить сессию; в onend ставим разрез
+  // и сессия сразу перезапускается. Так сказанное до нажатия целиком остаётся в прежней мысли.
+  split() {
+    if (!this.on || !this.r || this.cutPending) return false;
+    this.cutPending = true;
+    try { this.r.stop(); } catch {}
+    clearTimeout(this.cutT);
+    this.cutT = setTimeout(() => { if (this.cutPending) try { this.r.abort(); } catch {} }, 2500);
+    return true;
+  },
   start(note) {
     this.note = note; this.on = true; this.done = []; this.cur = ''; this.err = ''; this.quick = 0; this.revives = 0;
+    this.cuts = []; this.cutPending = false;
     this.spawn();
     // Сторож: иногда Safari запускает распознавание, но оно не получает звук (в журнале «слушаю», текста нет,
     // при стопе «No speech detected»), хотя наш микрофон речь слышит. Тогда перезапускаем сессию,
@@ -678,7 +707,8 @@ const Sys = {
       for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript + ' ';
       this.cur = t.replace(/\s+/g, ' ').trim();
       this.quick = 0;
-      if (this.note) { this.note.segTexts = this.texts(); this.note.text = joinSegs(this.note); updateRecLive(); saveNote(this.note, 500); }
+      if (this.onText) this.onText();
+      else if (this.note) { this.note.segTexts = this.texts(); this.note.text = joinSegs(this.note); updateRecLive(); saveNote(this.note, 500); }
     };
     r.onerror = (e) => {
       trace('встроенное: ошибка ' + e.error + (e.message ? ' ' + e.message : ''));
@@ -695,9 +725,11 @@ const Sys = {
     r.onend = () => {
       if (this.cur) this.done.push(this.cur);
       this.cur = '';
+      const wasCut = this.cutPending;
+      if (wasCut) { this.cutPending = false; clearTimeout(this.cutT); this.cuts.push(this.done.length); trace('поток: следующая мысль'); this.onText?.(); }
       if (this.endWait) { const f = this.endWait; this.endWait = null; f(); return; }
       if (!this.on) return;
-      if (Date.now() - t0 < 1500 && ++this.quick > 5) { this.on = false; this.err = 'распознавание не запускается'; trace('встроенное: не запускается, сдаюсь'); updateRecLive(); return; }
+      if (!wasCut && Date.now() - t0 < 1500 && ++this.quick > 5) { this.on = false; this.err = 'распознавание не запускается'; trace('встроенное: не запускается, сдаюсь'); updateRecLive(); return; }
       try { this.spawn(); } catch (err) { trace('встроенное: перезапуск не удался ' + err); }
     };
     try { r.start(); } catch (err) { trace('встроенное: start ' + err); }
@@ -711,7 +743,7 @@ const Sys = {
       setTimeout(() => { if (this.endWait) { this.endWait = null; if (this.cur) { this.done.push(this.cur); this.cur = ''; } res(); } }, 2000);
     });
   },
-  abort() { this.on = false; this.note = null; clearInterval(this.dog); try { this.r?.abort(); } catch {} },
+  abort() { this.on = false; this.note = null; this.onText = null; clearInterval(this.dog); try { this.r?.abort(); } catch {} },
 };
 
 /* ================= Перераспознавание ================= */
@@ -745,7 +777,7 @@ const PC = {
 const pcOn = () => !!PC.token();
 // pcActive/pcBoxHTML работают и с заметкой, и с отдельной записью журнала (у обеих есть .pc / .pcText)
 const pcActive = (n) => n.pc && (n.pc.state === 'outbox' || n.pc.state === 'queued');
-const pcAnyActive = (n) => pcActive(n) || (n.clips || []).some(pcActive);
+const pcAnyActive = (n) => pcActive(n) || (n.clips || []).some(pcActive) || (n.frags || []).some(pcActive);
 const pcAnyReady = (n) => n.pc?.state === 'ready' || (n.clips || []).some((c) => c.pc?.state === 'ready');
 // всё, что отправлено на ПК: заметка целиком (ключ = id) и записи журнала (ключ = id--clip)
 function pcUnits() {
@@ -753,6 +785,7 @@ function pcUnits() {
   for (const n of notes) {
     if (n.pc) out.push({ n, o: n, key: n.id });
     for (const c of n.clips || []) if (c.pc) out.push({ n, o: c, c, key: clipKey(n, c) });
+    for (const f of n.frags || []) if (f.pc) out.push({ n, o: f, f, key: clipKey(n, f) });
   }
   return out;
 }
@@ -865,7 +898,7 @@ async function pcSync() {
       if (u && pcActive(u.o)) {
         const n = u.n;
         const res = JSON.parse(await d.download('app:/results/' + f.name));
-        const how = u.c ? applyClipResult(n, u.c, res) : applyPCResult(n, res);
+        const how = u.f ? applyFragResult(n, u.f, res) : u.c ? applyClipResult(n, u.c, res) : applyPCResult(n, res);
         trace(`ПК: результат ${id} → ${how}`);
         saveNote(n); onNoteChanged(n);
         toast(how === 'error' ? 'Компьютер не смог распознать запись' : how === 'replaced' ? `Готова расшифровка с компьютера: «${titleOf(n)}»` : `Расшифровка с компьютера готова — ваш исправленный текст не тронут`, 4000);
@@ -982,11 +1015,313 @@ function pickAudioFiles() {
   inp.click();
 }
 
+/* ================= Поток: одна длинная запись, разобранная на мысли ================= */
+// Поток — заметка с stream: true и списком мыслей frags (в главном списке не показывается).
+// Во время записи кнопка «Следующая мысль» начинает новую мысль; аудио режется ровно по нажатию.
+// Каждую мысль потом можно вынести в отдельную заметку (с её куском аудио), удалить или оставить.
+// frag = { id, at, text, duration, hasAudio, isNew, edited, pc, pcText, startSec, rec, segs, pending }
+// Аудио мысли — store audio, ключ <streamId>--<fragId> (как у записей журнала, pc-agent тот же).
+let recStream = null, curFrag = null;
+const streams = () => notes.filter((n) => n.stream).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+const fragTime = (f) => new Date(f.at).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+function syncStreamText(s) { s.text = (s.frags || []).map((f) => (f.text || '').trim()).filter(Boolean).join('\n\n'); }
+
+async function createStream() {
+  const name = prompt('Название потока:', 'Входящие идеи'); if (!name?.trim()) return null;
+  if (findByTitle(name)) { toast('Заметка или поток с таким названием уже есть'); return null; }
+  const s = { id: uid(), createdAt: Date.now(), updatedAt: Date.now(), title: name.trim(), text: '', tags: [], projectId: null, status: 'done', stream: true, frags: [] };
+  notes.unshift(s); saveNote(s);
+  return s;
+}
+
+function newFrag(s) {
+  const f = { id: uid(), at: Date.now(), text: '', isNew: true, rec: true, startSec: rec ? rec.seconds : 0, segs: [], pending: 0 };
+  s.frags = [...(s.frags || []), f];
+  curFrag = f;
+  return f;
+}
+function enqueueFrag(s, f, audio) {
+  const i = f.segs.length; f.segs.push(null); f.pending++;
+  ASR.run(audio).then((m) => {
+    f.segs[i] = m.error ? '' : clean(m.text); f.pending--;
+    if (!f.edited) f.text = f.segs.filter(Boolean).join(' ');
+    syncStreamText(s); saveNote(s, 300);
+    updateStreamLive(); onNoteChanged(s);
+  });
+}
+// текст встроенного распознавания раскладываем по мыслям этой записи
+function applySysGroups(s) {
+  const g = Sys.groups(), fs = (s.frags || []).filter((f) => f.rec);
+  fs.forEach((f, i) => { f.text = g[i] || ''; });
+  syncStreamText(s);
+}
+
+async function startStream(s) {
+  if (rec) return;
+  if ((s.frags || []).some((f) => f.pending)) { toast('Дождитесь окончания распознавания'); return; }
+  const sys = useSys();
+  trace('поток: запись' + (sys ? ' (встроенное)' : ''));
+  rec = sys && ls.get('vn.sysNoRec', false) ? new NullRecorder() : new Recorder();
+  recStream = s;
+  try {
+    await rec.start({
+      segOpts: { minSec: 3, maxSec: S.segMax, silenceMs: 500 },
+      onSegment: (a) => { if (!sys && curFrag) enqueueFrag(s, curFrag, a); },
+      log: trace,
+    });
+    s.recAt = Date.now(); s.status = 'recording'; s.parts = 0;
+    newFrag(s);
+    if (sys) { Sys.onText = () => { applySysGroups(s); updateStreamLive(); saveNote(s, 800); }; Sys.start(s); }
+  } catch (e) {
+    rec = null; recStream = null; curFrag = null;
+    if (sys) Sys.abort();
+    s.frags = (s.frags || []).filter((f) => !f.rec); s.status = 'done';
+    trace('поток: ошибка ' + (e?.name || '') + ' ' + (e?.message || e));
+    toast(e?.name === 'NotAllowedError' ? 'Нет доступа к микрофону. Разрешите его в настройках Safari.' : 'Микрофон недоступен: ' + (e?.message || e), 4500);
+    return;
+  }
+  saveNote(s);
+  try { wake = await navigator.wakeLock?.request('screen'); } catch {}
+  renderStreamRec();
+  recTimer = setInterval(updateRec, 100);
+  const r = rec;
+  recSaver = setInterval(async () => {
+    if (rec !== r) return;
+    const pcm = r.takeNew(); if (!pcm.length) return;
+    const k = s.parts++;
+    await DB.put('audio', encodeWav(pcm), s.id + '--rec:p' + k);
+    saveNote(s);
+  }, 5000);
+  if (!sys && !ls.get('vn.safe', false)) setTimeout(() => ASR.ensure(), 300);
+}
+
+function nextThought() {
+  const s = recStream; if (!s || !rec) return;
+  if (useSys() && Sys.note === s) { if (!Sys.split()) return; }
+  else rec.cut(); // Whisper: недоговорённый кусок уходит в прежнюю мысль
+  // слишком частые нажатия (меньше секунды) не плодят пустые мысли
+  if (curFrag && rec.seconds - curFrag.startSec < 1 && !curFrag.text && !curFrag.segs.length) { curFrag.startSec = rec.seconds; curFrag.at = Date.now(); return; }
+  newFrag(s);
+  saveNote(s);
+  try { navigator.vibrate?.(30); } catch {}
+  updateStreamLive();
+}
+
+async function stopStream() {
+  clearInterval(recTimer); clearInterval(recSaver);
+  const r = rec, s = recStream; rec = null; recStream = null;
+  trace('поток: стоп');
+  if (Sys.note === s) { await Sys.stop(); applySysGroups(s); Sys.note = null; Sys.onText = null; }
+  const total = r.seconds;
+  const pcm = await rec_stop(r); // Whisper: последний кусок уходит в текущую мысль
+  curFrag = null;
+  try { await wake?.release(); } catch {}
+  wake = null;
+  await finishStream(s, pcm, total);
+  $('.rec')?.remove();
+  if (location.hash === '#/s/' + s.id) renderStream(s.id, true); else location.hash = '#/s/' + s.id;
+}
+// режем аудио по мыслям, убираем пустые, чистим временные куски автосохранения
+async function finishStream(s, pcm, total) {
+  const fs = (s.frags || []).filter((f) => f.rec);
+  const end = pcm.length ? pcm.length / 16000 : total;
+  for (let i = 0; i < fs.length; i++) {
+    const f = fs[i], a = f.startSec || 0, b = i + 1 < fs.length ? fs[i + 1].startSec : end;
+    f.duration = Math.max(0, b - a);
+    const slice = pcm.subarray(Math.floor(a * 16000), Math.floor(b * 16000));
+    if (S.keepAudio && slice.length > 16000 * 0.5) { await DB.put('audio', encodeWav(slice), clipKey(s, f)); f.hasAudio = true; }
+    delete f.rec; delete f.startSec;
+  }
+  s.frags = s.frags.filter((f) => f.rec || (f.text || '').trim() || f.pending || f.hasAudio);
+  for (let i = 0; i < (s.parts || 0); i++) await DB.del('audio', s.id + '--rec:p' + i);
+  s.parts = 0; s.status = 'done'; delete s.recAt;
+  if (S.pcAuto && pcOn()) for (const f of fs) if (f.hasAudio && s.frags.includes(f)) f.pc = { state: 'outbox', sentAt: Date.now() };
+  syncStreamText(s); saveNote(s);
+  if (fs.some((f) => f.pc)) pcSync();
+}
+
+function renderStreamRec() {
+  const el = document.createElement('div');
+  el.className = 'rec';
+  el.innerHTML = `
+    <div class="small center" style="padding:6px 0 2px">Поток «${esc(recStream.title)}»</div>
+    <div class="timer" id="rtime">0:00</div>
+    <div class="meter"><i id="rlvl"></i></div>
+    <div class="small center" id="recq">${esc(recInfo())}</div>
+    <div class="live" id="rlive"></div>
+    <button class="btn primary nextbtn" id="rnext">➜ Следующая мысль</button>
+    <button class="stopbtn" id="rstop" aria-label="Остановить"><i></i></button>
+    <div class="small center" style="margin-top:10px">Закончили мысль — нажмите «Следующая мысль» и продолжайте.</div>`;
+  document.body.appendChild(el);
+  $('#rstop').onclick = stopRecording;
+  $('#rnext').onclick = nextThought;
+  updateStreamLive();
+}
+function updateStreamLive() {
+  const box = $('#rlive'); if (!box || !recStream) return;
+  const fs = (recStream.frags || []).filter((f) => f.rec);
+  box.innerHTML = fs.map((f, i) => {
+    const pend = f.segs?.some((x) => x === null) ? ' <span class="pend">…</span>' : '';
+    const last = i === fs.length - 1;
+    return `<div class="lf${last ? ' cur' : ''}"><div class="small">Мысль ${i + 1}</div>${esc(f.text || '') || (last ? '<span class="pend">Говорите…</span>' : '<span class="pend">…</span>')}${pend}</div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+  const q = $('#recq'); if (q) q.textContent = recInfo();
+}
+
+/* ---- Действия с мыслью ---- */
+async function fragToNote(s, f) {
+  if (f.pending) { toast('Мысль ещё распознаётся'); return; }
+  if (pcActive(f)) { toast('Мысль ждёт расшифровку с ПК — отмените или дождитесь'); return; }
+  const n = { id: uid(), createdAt: Date.now(), updatedAt: Date.now(), title: '', tags: [], projectId: null, status: 'done', segTexts: null, prefix: '' };
+  n.head = clipHead(n, f.at);
+  n.text = n.head + '\n' + (f.text || '').trim() + `\n\nИз потока [[${s.title}]]`;
+  if (f.hasAudio) {
+    const blob = await DB.get('audio', clipKey(s, f));
+    if (blob) { await DB.put('audio', blob, n.id); n.hasAudio = true; n.duration = f.duration; }
+    await DB.del('audio', clipKey(s, f));
+  }
+  notes.unshift(n); saveNote(n);
+  s.frags = s.frags.filter((x) => x !== f); syncStreamText(s); saveNote(s);
+  trace('поток: мысль → заметка ' + n.id);
+  toast(`Создана заметка «${titleOf(n)}»`);
+  return n;
+}
+async function deleteFrag(s, f) {
+  if (pcActive(f)) await cancelPC(s, f);
+  if (f.hasAudio) await DB.del('audio', clipKey(s, f));
+  s.frags = s.frags.filter((x) => x !== f); syncStreamText(s); saveNote(s);
+}
+function applyFragResult(s, f, res) {
+  if (res.error) { f.pc = { ...f.pc, state: 'error', err: res.error }; return 'error'; }
+  const text = (res.text || '').trim();
+  const editing = document.activeElement?.dataset?.fedit === f.id;
+  f.pc = { ...f.pc, state: !f.edited && !editing ? 'done' : 'ready', model: res.model, device: res.device, doneAt: Date.now() };
+  if (f.pc.state === 'done') { f.text = text; delete f.pcText; syncStreamText(s); return 'replaced'; }
+  f.pcText = text; return 'ready';
+}
+function fragPCHTML(f) {
+  const p = f.pc;
+  if (!p) return '';
+  const B = (a, l, c = '') => `<button class="btn ${c}" data-fpc="${a}" data-fid="${f.id}">${l}</button>`;
+  if (p.state === 'ready' && f.pcText) return `<div class="warnbox pcbox">Готова расшифровка с компьютера, но вы правили эту мысль:<div class="s" style="margin:6px 0">${esc(f.pcText)}</div><div class="btns">${B('replace', 'Заменить', 'primary')}${B('reject', 'Оставить мой')}</div></div>`;
+  if (p.state === 'error') return `<div class="warnbox">Компьютер не смог распознать: ${esc(p.err || 'ошибка')}. ${B('retry', 'Ещё раз')}</div>`;
+  if (pcActive(f)) return `<div class="small" style="margin-top:6px">🖥 ${p.state === 'outbox' ? 'ждёт отправки' : pcOnlineText().on ? 'в очереди на компьютер' : 'ждёт, когда включится компьютер'} · <a data-fpc="cancel" data-fid="${f.id}">отменить</a></div>`;
+  return '';
+}
+
+/* ---- Экраны ---- */
+function renderStreams() {
+  const list = streams();
+  app.innerHTML = `
+  <header class="top"><div class="wrap row"><a class="iconbtn" href="#/" aria-label="Назад">${I.back}</a><h1 class="grow" style="margin:0">Потоки</h1></div></header>
+  <main class="wrap">
+    <div class="small" style="margin:4px 0 12px">Поток — длинная запись подряд. Во время записи нажимайте «Следующая мысль», потом каждую мысль можно вынести в отдельную заметку, удалить или оставить в потоке.</div>
+    ${list.map((s) => {
+      const nn = (s.frags || []).filter((f) => f.isNew).length;
+      return `<a class="card" href="#/s/${encodeURIComponent(s.id)}" style="margin-bottom:8px"><div class="t">🌊 ${esc(s.title)}</div>
+        <div class="meta"><span>мыслей: ${(s.frags || []).length}</span>${nn ? `<span style="color:var(--accent)">новых: ${nn}</span>` : ''}<span>${fmtDate(s.updatedAt || s.createdAt)}</span></div></a>`;
+    }).join('') || '<div class="empty">Потоков пока нет</div>'}
+    <button class="btn primary" id="adds" style="margin-top:8px">+ Новый поток</button>
+  </main>`;
+  $('#adds').onclick = async () => { const s = await createStream(); if (s) location.hash = '#/s/' + s.id; };
+}
+
+function renderStream(id, scrollNew) {
+  const s = notes.find((x) => x.id === id);
+  if (!s) { app.innerHTML = '<div class="wrap empty">Поток не найден. <a href="#/streams">К потокам</a></div>'; return; }
+  const fs = s.frags || [], nNew = fs.filter((f) => f.isNew).length;
+  const edit = renderStream.edit || null;
+  app.innerHTML = `
+  <header class="top"><div class="wrap row">
+    <a class="iconbtn" href="#/streams" aria-label="Назад">${I.back}</a>
+    <div class="grow small">🌊 Поток · мыслей: ${fs.length}${nNew ? ' · новых: ' + nNew : ''}</div>
+  </div></header>
+  <main class="wrap" style="padding-bottom:130px">
+    <input class="title-in" id="stitle" value="${esc(s.title)}">
+    ${nNew > 1 ? `<div class="btns" style="margin:4px 0 10px"><button class="btn" id="keepall">✓ Оставить все новые (${nNew})</button></div>` : ''}
+    ${fs.length ? '' : '<div class="empty">Пока пусто. Нажмите красную кнопку и говорите подряд; между мыслями нажимайте «Следующая мысль».</div>'}
+    ${fs.map((f, i) => `<div class="card frag${f.isNew ? ' new' : ''}" data-frag="${f.id}">
+      <div class="meta" style="margin:0 0 6px"><b>${i + 1}.</b><span>${esc(fragTime(f))}</span>${f.duration ? `<span>${fmtDur(f.duration)}</span>` : ''}${f.isNew ? '<span style="color:var(--accent)">новая</span>' : ''}${f.pending ? '<span>⏳ распознаётся</span>' : ''}</div>
+      ${edit === f.id ? `<textarea class="field" data-fedit="${f.id}" style="min-height:120px">${esc(f.text || '')}</textarea>`
+        : `<div class="ftext" data-ftext="${f.id}">${esc(f.text || '') || '<span class="small">без текста</span>'}</div>`}
+      <div data-faudio="${f.id}">${f.hasAudio ? `<button class="btn" data-fplay="${f.id}" style="margin-top:8px">▶ Аудио</button>` : ''}</div>
+      ${fragPCHTML(f)}
+      <div class="btns" style="margin-top:8px">
+        <button class="btn primary" data-fnote="${f.id}">➜ В заметку</button>
+        ${f.isNew ? `<button class="btn" data-fkeep="${f.id}">✓ Оставить</button>` : ''}
+        <button class="btn" data-fed="${f.id}">${edit === f.id ? 'Готово' : '✎'}</button>
+        ${f.hasAudio && pcOn() && !pcActive(f) && f.pc?.state !== 'ready' ? `<button class="btn" data-ftopc="${f.id}" title="Распознать на ПК">🖥</button>` : ''}
+        <button class="btn danger" data-fdel="${f.id}">🗑</button>
+      </div></div>`).join('<div style="height:10px"></div>')}
+    <div class="btns" style="margin-top:18px"><button class="btn" id="scopy">📋 Скопировать весь текст</button><button class="btn danger" id="sdel">Удалить поток</button></div>
+  </main>
+  ${s.status === 'recording' ? '' : `<button class="fab" id="sfab" aria-label="Записать в поток">${I.mic}</button>`}`;
+
+  const get = (fid) => fs.find((f) => f.id === fid);
+  const redraw = () => { const keep = scrollY; renderStream(id); scrollTo(0, keep); };
+  $('#stitle').onchange = (e) => {
+    const nv = e.target.value.trim(), old = s.title;
+    if (!nv || nv === old) { e.target.value = old; return; }
+    if (findByTitle(nv)) { toast('Такое название уже занято'); e.target.value = old; return; }
+    s.title = nv; saveNote(s);
+    // ссылки «Из потока [[…]]» в вынесенных заметках переименовываются вместе с потоком
+    const esc2 = old.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), re = new RegExp('\\[\\[' + esc2 + '(\\]\\]|\\|)', 'g');
+    for (const n of notes) if (n !== s && re.test(n.text || '')) { n.text = n.text.replace(re, '[[' + nv + '$1'); saveNote(n); }
+  };
+  const fab = $('#sfab'); if (fab) fab.onclick = () => startStream(s);
+  const ka = $('#keepall'); if (ka) ka.onclick = () => { fs.forEach((f) => (f.isNew = false)); saveNote(s); redraw(); };
+  app.querySelectorAll('[data-fkeep]').forEach((b) => (b.onclick = () => { get(b.dataset.fkeep).isNew = false; saveNote(s); redraw(); }));
+  app.querySelectorAll('[data-fnote]').forEach((b) => (b.onclick = async () => { if (await fragToNote(s, get(b.dataset.fnote))) redraw(); }));
+  app.querySelectorAll('[data-fdel]').forEach((b) => (b.onclick = async () => {
+    const f = get(b.dataset.fdel);
+    if ((f.text || '').trim() && !confirm('Удалить эту мысль вместе с её аудио?')) return;
+    await deleteFrag(s, f); redraw();
+  }));
+  app.querySelectorAll('[data-fed]').forEach((b) => (b.onclick = () => {
+    const f = get(b.dataset.fed);
+    if (f.pending) { toast('Дождитесь окончания распознавания'); return; }
+    renderStream.edit = renderStream.edit === f.id ? null : f.id; redraw();
+    if (renderStream.edit) $(`[data-fedit="${f.id}"]`)?.focus();
+  }));
+  app.querySelectorAll('[data-fedit]').forEach((ta) => (ta.oninput = () => {
+    const f = get(ta.dataset.fedit); f.text = ta.value; f.edited = true; syncStreamText(s); saveNote(s, 500);
+  }));
+  app.querySelectorAll('[data-fplay]').forEach((b) => (b.onclick = async () => {
+    const f = get(b.dataset.fplay), blob = await DB.get('audio', clipKey(s, f));
+    const box = $(`[data-faudio="${f.id}"]`); if (!box) return;
+    if (!blob) { box.innerHTML = '<div class="small">Аудио не найдено</div>'; return; }
+    box.innerHTML = `<audio controls autoplay style="margin-top:8px;width:100%" src="${URL.createObjectURL(blob)}"></audio>`;
+  }));
+  app.querySelectorAll('[data-ftopc]').forEach((b) => (b.onclick = () => {
+    const f = get(b.dataset.ftopc); f.pc = { state: 'outbox', sentAt: Date.now() }; saveNote(s); redraw();
+    toast(pcOnlineText().on ? 'Отправляю на компьютер…' : 'Компьютер выключен — задание будет ждать в очереди'); pcSync();
+  }));
+  app.querySelectorAll('[data-fpc]').forEach((b) => (b.onclick = async () => {
+    const f = get(b.dataset.fid), a = b.dataset.fpc; if (!f) return;
+    if (a === 'cancel') await cancelPC(s, f);
+    else if (a === 'retry') { f.pc = { state: 'outbox', sentAt: Date.now() }; saveNote(s); pcSync(); }
+    else if (a === 'replace') { f.text = f.pcText || f.text; delete f.pcText; f.pc = { ...f.pc, state: 'done' }; f.edited = false; syncStreamText(s); saveNote(s); }
+    else if (a === 'reject') { delete f.pcText; f.pc = { ...f.pc, state: 'done' }; saveNote(s); }
+    redraw();
+  }));
+  $('#scopy').onclick = async () => { const t = fs.map((f) => (f.text || '').trim()).filter(Boolean).join('\n\n'); if (!t) { toast('Текста пока нет'); return; } toast(await copyText(t) ? 'Текст скопирован' : 'Не удалось скопировать'); };
+  $('#sdel').onclick = async () => {
+    if (!confirm(`Удалить поток «${s.title}» со всеми мыслями и аудио? Вынесенные заметки останутся.`)) return;
+    for (const f of fs) { if (pcActive(f)) await cancelPC(s, f); await DB.del('audio', clipKey(s, f)); }
+    notes = notes.filter((x) => x !== s); await DB.del('notes', s.id);
+    location.hash = '#/streams';
+  };
+  if (scrollNew) { const first = app.querySelector('.frag.new'); if (first) first.scrollIntoView({ block: 'start' }); }
+}
+
 /* ================= Роутинг ================= */
 function route() {
   const h = location.hash.slice(1);
   let m;
   if ((m = h.match(/^\/n\/(.+)$/))) return { name: 'note', id: decodeURIComponent(m[1]) };
+  if ((m = h.match(/^\/s\/(.+)$/))) return { name: 'stream', id: decodeURIComponent(m[1]) };
+  if (h === '/streams') return { name: 'streams' };
   if (h === '/settings') return { name: 'settings' };
   if (h === '/projects') return { name: 'projects' };
   return { name: 'home' };
@@ -994,6 +1329,8 @@ function route() {
 function render() {
   const r = route();
   if (r.name === 'note') renderNote(r.id);
+  else if (r.name === 'stream') renderStream(r.id);
+  else if (r.name === 'streams') renderStreams();
   else if (r.name === 'settings') renderSettings();
   else if (r.name === 'projects') renderProjects();
   else renderHome();
@@ -1006,6 +1343,7 @@ function renderHome() {
   <header class="top"><div class="wrap">
     <div class="row"><h1 class="grow">Заметки</h1>
       <button class="iconbtn" id="impbtn" aria-label="Добавить аудиофайл" title="Добавить голосовое из файла (Telegram)">${I.file}</button>
+      <a class="iconbtn" href="#/streams" aria-label="Потоки" title="Потоки — длинная запись, разобранная на мысли">${I.wave}</a>
       <a class="iconbtn" href="#/projects" aria-label="Проекты">${I.folder}</a>
       <a class="iconbtn" href="#/settings" aria-label="Настройки">${I.gear}</a></div>
     <input class="search" id="q" type="search" placeholder="Поиск по тексту, #меткам, [[связям]]" value="${esc(filter.q)}">
@@ -1026,7 +1364,7 @@ function renderChips() {
   let html = c(null, 'Все') + projects.map((p) => c(p.id, p.name)).join('') + c('none', 'Без проекта');
   if (filter.tag) html = `<button class="chip tag on" id="tagoff">#${esc(filter.tag)} ✕</button>` + html;
   const allTags = {};
-  notes.forEach((n) => tagsOf(n).forEach((t) => (allTags[t] = (allTags[t] || 0) + 1)));
+  notes.forEach((n) => { if (!n.stream) tagsOf(n).forEach((t) => (allTags[t] = (allTags[t] || 0) + 1)); });
   html += Object.entries(allTags).filter(([t]) => t !== filter.tag).sort((a, b) => b[1] - a[1]).slice(0, 12)
     .map(([t]) => `<button class="chip tag" data-tag="${esc(t)}">#${esc(t)}</button>`).join('');
   el.innerHTML = html;
@@ -1037,6 +1375,7 @@ function renderChips() {
 function filtered() {
   const q = filter.q.trim().toLowerCase();
   return notes.filter((n) => {
+    if (n.stream) return false;
     if (filter.project === 'none' && n.projectId) return false;
     if (filter.project && filter.project !== 'none' && n.projectId !== filter.project) return false;
     if (filter.tag && !tagsOf(n).includes(filter.tag)) return false;
@@ -1050,7 +1389,7 @@ function filtered() {
 function renderList() {
   const el = $('#list'); if (!el) return;
   const list = filtered();
-  if (!notes.length) {
+  if (!notes.some((n) => !n.stream)) {
     el.innerHTML = `<div class="empty">Пока пусто.<br>Нажмите красную кнопку и надиктуйте первую заметку.<br><br><span class="small">Первая запись скачает модель распознавания (${MODELS[S.model].size}). Дальше всё работает без интернета.</span></div>`;
     return;
   }
@@ -1099,6 +1438,7 @@ function statusHTML(n) {
 function renderNote(id) {
   const n = notes.find((x) => x.id === id);
   if (!n) { app.innerHTML = '<div class="wrap empty">Заметка не найдена. <a href="#/">На главную</a></div>'; return; }
+  if (n.stream) { history.replaceState(null, '', '#/s/' + encodeURIComponent(id)); renderStream(id); return; }
   if (lastNoteId !== id) { editMode = !n.text && n.status === 'done'; lastNoteId = id; }
   const busy = n.status === 'transcribing' && jobs.has(n.id);
   const clips = n.clips || [];
@@ -1486,6 +1826,20 @@ async function exportMarkdown(withAudio) {
     const fm = ['---', `created: ${new Date(n.createdAt).toISOString()}`, proj ? `project: "${proj.replace(/"/g, "'")}"` : null,
       `tags: [${tagsOf(n).map((t) => JSON.stringify(t)).join(', ')}]`, n.duration ? `duration: ${fmtDur(n.duration)}` : null, '---'].filter(Boolean).join('\n');
     let body = fm + '\n\n' + (n.text || '');
+    // поток: каждая мысль — свой раздел, аудио мысли под заголовком
+    if (n.stream) {
+      body = fm;
+      for (const f of n.frags || []) {
+        let part = `### 💭 ${fragTime(f)}`;
+        if (withAudio && f.hasAudio) {
+          const blob = await DB.get('audio', clipKey(n, f));
+          if (blob) { zip.file(`audio/${clipKey(n, f)}.wav`, blob); part += `\n![[audio/${clipKey(n, f)}.wav]]`; }
+        }
+        body += '\n\n' + part + '\n' + (f.text || '').trim();
+      }
+      zip.file('Потоки/' + name + '.md', body + '\n');
+      continue;
+    }
     if (proj) body += `\n\nПроект: [[${proj}]]`;
     if (withAudio && n.hasAudio) {
       const blob = await DB.get('audio', n.id);
@@ -1514,7 +1868,7 @@ async function importJSON(e) {
     const d = JSON.parse(await f.text());
     let added = 0;
     for (const p of d.projects || []) if (!projects.find((x) => x.id === p.id)) { projects.push(p); await DB.put('projects', p); }
-    for (const n of d.notes || []) if (!notes.find((x) => x.id === n.id)) { if (n.status !== 'done') n.status = 'done'; n.hasAudio = false; (n.clips || []).forEach((c) => (c.hasAudio = false)); notes.push(n); await DB.put('notes', n); added++; }
+    for (const n of d.notes || []) if (!notes.find((x) => x.id === n.id)) { if (n.status !== 'done') n.status = 'done'; n.hasAudio = false; (n.clips || []).forEach((c) => (c.hasAudio = false)); (n.frags || []).forEach((f) => (f.hasAudio = false)); notes.push(n); await DB.put('notes', n); added++; }
     toast(`Импортировано заметок: ${added}`); renderSettings();
   } catch (err) { toast('Не удалось прочитать файл: ' + err.message); }
 }
@@ -1554,6 +1908,17 @@ async function importJSON(e) {
   // 2) Восстанавливаем записи, прерванные вылетом
   for (const n of notes) {
     if (n.status !== 'recording') continue;
+    // поток: собираем звук из кусков автосохранения и режем по мыслям
+    if (n.stream) {
+      const pieces = [];
+      for (let i = 0; i < (n.parts || 0); i++) { const b = await DB.get('audio', n.id + '--rec:p' + i); if (b) pieces.push(await decodeWav(b)); }
+      const all = new Float32Array(pieces.reduce((t, p) => t + p.length, 0)); let o = 0;
+      for (const p of pieces) { all.set(p, o); o += p.length; }
+      (n.frags || []).forEach((f) => { if (f.rec) { f.pending = 0; f.recovered = true; } });
+      await finishStream(n, all, all.length / 16000);
+      trace('поток: восстановлен после вылета');
+      continue;
+    }
     // дозапись в существующую заметку: звук собираем в аудио этой записи, а не всей заметки
     const clip = n.recClip ? (n.clips || []).find((c) => c.id === n.recClip) : null;
     const key = clip ? clipKey(n, clip) : n.id, holder = clip || n;
