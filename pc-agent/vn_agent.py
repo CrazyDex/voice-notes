@@ -33,7 +33,7 @@ proxy_fix.fix(direct=_DIRECT)
 
 import requests  # noqa: E402  (после настройки прокси)
 
-AGENT_VERSION = '1.0'
+AGENT_VERSION = '1.1'
 API = os.environ.get('VN_YD_API', 'https://cloud-api.yandex.net/v1/disk')
 HOME = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'voice-notes-agent')
 TOKEN_FILE = os.path.join(HOME, 'token.txt')
@@ -253,6 +253,8 @@ class Engine:
 # ---------------- Основной цикл ----------------
 class Agent:
     def __init__(self, token, cfg):
+        self.token = token
+        self.busy = False
         self.d = Disk(token)
         self.cfg = cfg
         self.eng = Engine(cfg)
@@ -284,6 +286,7 @@ class Agent:
             path = 'app:/jobs/' + j['name']
             log.info('Задание %s (%.1f МБ)', nid, (j.get('size') or 0) / 1e6)
             self.d.props(path, {'status': 'working', 'startedAt': int(time.time() * 1000)})
+            self.busy = True
             self.beat(busy=True, force=True)
             fd, tmp = tempfile.mkstemp(suffix='.wav')
             os.close(fd)
@@ -304,6 +307,7 @@ class Agent:
                     os.remove(tmp)
                 except OSError:
                     pass
+                self.busy = False
             self.beat(force=True)
         return len(jobs)
 
@@ -316,8 +320,29 @@ class Agent:
             self.eng.unload_if_idle()
         return n
 
+    def heartbeat_loop(self):
+        """Отметка «в сети» в отдельном потоке: пока идёт долгое распознавание
+        (или первая загрузка модели), телефон не должен считать компьютер выключенным."""
+        import threading
+        d = Disk(self.token)
+
+        def loop():
+            while True:
+                time.sleep(self.cfg['heartbeat_sec'])
+                try:
+                    d.props('app:/pc.json', {
+                        'seen': int(time.time() * 1000), 'busy': 1 if self.busy else 0, 'agent': AGENT_VERSION,
+                        'model': self.eng.name or self.cfg['model'],
+                        'device': self.eng.device or ('cpu' if self.cfg['device'] == 'cpu' or self.eng.cuda_failed else 'cuda'),
+                    })
+                except Exception as e:
+                    log.info('Отметка «в сети» не ушла: %s', e.__class__.__name__)
+        threading.Thread(target=loop, daemon=True).start()
+
     def run(self):
-        log.info('Запуск программы распознавания v%s', AGENT_VERSION)
+        log.info('Запуск программы распознавания v%s (прокси: %s)', AGENT_VERSION,
+                 os.environ.get('HTTPS_PROXY') or ('нет' if not os.environ.get('NO_PROXY') else 'напрямую'))
+        self.heartbeat_loop()
         delay = self.cfg['poll_sec']
         while True:
             try:
@@ -391,4 +416,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        log.info('Программа упала:\n%s', traceback.format_exc())
+        raise
