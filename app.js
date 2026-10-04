@@ -1,4 +1,4 @@
-import { Recorder, NullRecorder, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.5';
+import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.6';
 import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.5';
 
 /* ================= Настройки ================= */
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.5';
+const VERSION = '1.6';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -451,12 +451,14 @@ async function startRecording(target) {
   rec = sys && ls.get('vn.sysNoRec', false) ? new NullRecorder() : new Recorder();
   segIndex = 0;
   try {
-    if (sys) Sys.start(note);
+    // сначала микрофон, потом распознавание: пока наш поток открыт, Safari не спрашивает разрешение
+    // второй раз для распознавания (раньше оба запроса шли одновременно — два вопроса подряд)
     await rec.start({
       segOpts: { minSec: 3, maxSec: S.segMax, silenceMs: 500 },
       onSegment: (a) => { if (!sys) enqueue(note, a, segIndex++); },
       log: trace,
     });
+    if (sys) Sys.start(note);
   } catch (e) {
     rec = null;
     if (sys) Sys.abort();
@@ -635,7 +637,7 @@ const Sys = {
         // микрофон занят нашей записью звука: дальше пишем только текст
         ls.set('vn.sysNoRec', true);
         trace('встроенное: отключаю запись звука, чтобы освободить микрофон');
-        const old = rec; rec = new NullRecorder(old.seconds); rec.start(); old.stop().catch(() => {});
+        const old = rec; rec = new NullRecorder(old.seconds); rec.start(); old.stop().catch(() => {}).finally(() => releaseMic(true));
       } else if (e.error !== 'no-speech' && e.error !== 'aborted') this.err = e.error;
     };
     r.onend = () => {
@@ -1520,4 +1522,4 @@ document.addEventListener('visibilitychange', () => { markAlive(!document.hidden
 setTimeout(() => checkUpdate(false), 3000);
 // Предупреждение, если закрывают во время записи
 addEventListener('pagehide', () => { if (rec) stopRecording(); });
-document.addEventListener('visibilitychange', () => { if (document.hidden && rec) stopRecording(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { if (rec) stopRecording().finally(() => releaseMic(true)); else releaseMic(true); } });

@@ -82,13 +82,34 @@ const WORKLET = `class Cap extends AudioWorkletProcessor{constructor(){super();t
 process(inp){const c=inp[0]&&inp[0][0];if(c){for(let i=0;i<c.length;i++){this.b[this.n++]=c[i];if(this.n===2048){this.port.postMessage(this.b.slice(0));this.n=0}}}return true}}
 registerProcessor('cap',Cap)`;
 
+// Один поток микрофона на всё приложение. iOS (особенно на экране «Домой») спрашивает разрешение
+// при каждом новом getUserMedia после того, как прежний поток остановлен, поэтому между записями
+// поток не закрываем сразу, а держим ещё MIC_KEEP_MS (и отпускаем, когда приложение свёрнуто).
+const MIC_KEEP_MS = 3 * 60 * 1000;
+let micStream = null, micTimer = null;
+const micLive = () => micStream && micStream.getAudioTracks().some((t) => t.readyState === 'live');
+export async function getMic(log = () => {}) {
+  clearTimeout(micTimer); micTimer = null;
+  if (micLive()) { micStream.getAudioTracks().forEach((t) => { t.enabled = true; }); log('запись: микрофон уже открыт'); return micStream; }
+  log('запись: запрос микрофона');
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  log('запись: микрофон получен');
+  return micStream;
+}
+export function releaseMic(now = false) {
+  clearTimeout(micTimer); micTimer = null;
+  if (!micStream) return;
+  const close = () => { micTimer = null; micStream?.getTracks().forEach((t) => t.stop()); micStream = null; };
+  if (now) { close(); return; }
+  micStream.getAudioTracks().forEach((t) => { t.enabled = false; });
+  micTimer = setTimeout(close, MIC_KEEP_MS);
+}
+
 export class Recorder {
   async start({ onSegment, segOpts, log = () => {} }) {
-    log('запись: запрос микрофона');
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-    log('запись: микрофон получен');
+    this.stream = await getMic(log);
     const AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC();
     await this.ctx.resume();
@@ -125,7 +146,7 @@ export class Recorder {
   get seconds() { return (this.samples || 0) / 16000; }
   async stop() {
     try { this.node.port.onmessage = null; this.src.disconnect(); this.node.disconnect(); } catch {}
-    this.stream.getTracks().forEach((t) => t.stop());
+    releaseMic();
     try { await this.ctx.close(); } catch {}
     this.seg.flush();
     const all = new Float32Array(this.samples);
