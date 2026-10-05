@@ -41,7 +41,7 @@ if defined VNPROXY (
   set "HTTPS_PROXY=%VNPROXY%"
 )
 "%PY%" -m pip install --upgrade pip
-"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests sherpa-onnx nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
 if not errorlevel 1 goto pip_ok
 if not defined VNPROXY goto pip_fail
 echo.
@@ -50,7 +50,7 @@ set "HTTP_PROXY="
 set "HTTPS_PROXY="
 set "NO_PROXY=*"
 "%PY%" -m pip install --upgrade pip
-"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests sherpa-onnx nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
 if not errorlevel 1 (
   echo {"proxy": "off"}> "%APPDATA%\voice-notes-agent\proxy.json"
   goto pip_ok

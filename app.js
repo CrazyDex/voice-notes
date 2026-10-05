@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.11';
+const VERSION = '1.12';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -604,6 +604,7 @@ function onNoteChanged(note) {
   const r = route();
   if (r.name === 'note' && r.id === note.id) updateNoteDyn(note);
   else if (r.name === 'stream' && r.id === note.id) { if (!$('[data-fedit]') && !$('audio')) { const keep = scrollY; renderStream(note.id); scrollTo(0, keep); } }
+  else if (r.name === 'meeting' && r.id === note.id) { const st = $('#mstat'); if (st && pcActive(note.meeting || {})) { st.innerHTML = meetingStatusHTML(note); bindMeetingStatus(note); } else if (!$('#maudio')?.src) renderMeeting(note.id); }
   else if (r.name === 'streams') renderStreams();
   else if (r.name === 'home') renderList();
   asrUI();
@@ -774,7 +775,7 @@ const PC = {
 const pcOn = () => !!PC.token();
 // pcActive/pcBoxHTML работают и с заметкой, и с отдельной записью журнала (у обеих есть .pc / .pcText)
 const pcActive = (n) => n.pc && (n.pc.state === 'outbox' || n.pc.state === 'queued');
-const pcAnyActive = (n) => pcActive(n) || (n.clips || []).some(pcActive) || (n.frags || []).some(pcActive);
+const pcAnyActive = (n) => pcActive(n) || (n.clips || []).some(pcActive) || (n.frags || []).some(pcActive) || (n.meeting ? pcActive(n.meeting) : false);
 const pcAnyReady = (n) => n.pc?.state === 'ready' || (n.clips || []).some((c) => c.pc?.state === 'ready');
 // всё, что отправлено на ПК: заметка целиком (ключ = id) и записи журнала (ключ = id--clip)
 function pcUnits() {
@@ -783,6 +784,7 @@ function pcUnits() {
     if (n.pc) out.push({ n, o: n, key: n.id });
     for (const c of n.clips || []) if (c.pc) out.push({ n, o: c, c, key: clipKey(n, c) });
     for (const f of n.frags || []) if (f.pc) out.push({ n, o: f, f, key: clipKey(n, f) });
+    if (n.meeting?.pc) out.push({ n, o: n.meeting, m: true, key: clipKey(n, n.meeting) });
   }
   return out;
 }
@@ -894,26 +896,29 @@ async function pcSync() {
       ls.set('vn.pcChecked', Date.now());
     } catch (e) { if (e.status !== 404) throw e; }
     if (!PC.dirsOk) { await d.mkdir('app:/jobs'); await d.mkdir('app:/results'); PC.dirsOk = true; }
-    for (const { n, o, key } of pcUnits().filter((u) => u.o.pc.state === 'outbox')) {
-      const blob = await DB.get('audio', key);
+    for (const u of pcUnits().filter((x) => x.o.pc.state === 'outbox')) {
+      const { n, o, key } = u;
+      let blob;
+      try { blob = u.m ? await meetingBlob(n) : await DB.get('audio', key); } catch (e) { blob = null; o.pc = { ...o.pc, state: 'error', err: e.message || String(e) }; saveNote(n); onNoteChanged(n); continue; }
       if (!blob) { o.pc = { ...o.pc, state: 'error', err: 'аудио не найдено' }; saveNote(n); continue; }
       await d.upload(`app:/jobs/${key}.wav`, blob);
-      try { await d.props(`app:/jobs/${key}.wav`, { lang: S.lang, sentAt: o.pc.sentAt }); } catch {}
+      try { await d.props(`app:/jobs/${key}.wav`, { lang: S.lang, sentAt: o.pc.sentAt, ...(u.m ? { mode: 'meeting', speakers: o.speakers || 0 } : {}) }); } catch {}
       o.pc = { ...o.pc, state: 'queued' }; saveNote(n); onNoteChanged(n);
       trace(`ПК: загружено ${key} (${(blob.size / 1e6).toFixed(1)} МБ)`);
     }
     const jobsOnDisk = await d.list('app:/jobs');
     PC.working = new Set(jobsOnDisk.filter((f) => f.custom_properties?.status === 'working').map((f) => f.name.replace(/\.wav$/, '')));
+    PC.progress = Object.fromEntries(jobsOnDisk.filter((f) => f.custom_properties?.progress != null).map((f) => [f.name.replace(/\.wav$/, ''), f.custom_properties]));
     for (const f of await d.list('app:/results')) {
       const id = f.name.replace(/\.json$/, '');
       const u = pcUnits().find((x) => x.key === id);
       if (u && pcActive(u.o)) {
         const n = u.n;
         const res = JSON.parse(await d.download('app:/results/' + f.name));
-        const how = u.f ? applyFragResult(n, u.f, res) : u.c ? applyClipResult(n, u.c, res) : applyPCResult(n, res);
+        const how = u.m ? applyMeetingResult(n, res) : u.f ? applyFragResult(n, u.f, res) : u.c ? applyClipResult(n, u.c, res) : applyPCResult(n, res);
         trace(`ПК: результат ${id} → ${how}`);
         saveNote(n); onNoteChanged(n);
-        toast(how === 'error' ? 'Компьютер не смог распознать запись' : how === 'replaced' ? `Готова расшифровка с компьютера: «${titleOf(n)}»` : `Расшифровка с компьютера готова — ваш исправленный текст не тронут`, 4000);
+        toast(how === 'meeting' ? `Готова расшифровка встречи: «${titleOf(n)}»` : how === 'error' ? 'Компьютер не смог распознать запись' : how === 'replaced' ? `Готова расшифровка с компьютера: «${titleOf(n)}»` : `Расшифровка с компьютера готова — ваш исправленный текст не тронут`, 4000);
       }
       await d.remove('app:/results/' + f.name);
     }
@@ -930,6 +935,7 @@ async function pcSync() {
       for (const c of n?.clips || []) { const st = $(`[data-cpcbox="${c.id}"]`); if (st) st.innerHTML = pcBoxHTML(c, c.id); }
       if (n) bindPCBox(n);
     }
+    if (r.name === 'meeting') { const n = notes.find((x) => x.id === r.id), st = $('#mstat'); if (n && st) { st.innerHTML = meetingStatusHTML(n); bindMeetingStatus(n); } }
     clearTimeout(PC.timer);
     // пока что-то ждёт компьютер — проверяем раз в 20 с, иначе раз в 2 мин (обновить «ПК в сети»)
     if (pcOn() && !document.hidden) PC.timer = setTimeout(pcSync, notes.some(pcAnyActive) ? 20000 : 120000);
@@ -1223,6 +1229,167 @@ function fragPCHTML(f) {
   return '';
 }
 
+/* ================= Расшифровка встречи ================= */
+// Вся запись (заметка с дозаписями или поток) одним файлом уходит на ПК; компьютер возвращает
+// реплики со временем и говорящим. n.meeting = { id: 'meet', pc, speakers, parts: [{key, start, dur}],
+//   segs: [{s, e, spk, text}], nspk, names: {0: 'Денис'}, audioSec, model, diarError }
+// Время реплик — от начала склеенной записи (части идут подряд, как в parts).
+const fmtTs = (x) => { x = Math.floor(x || 0); const h = Math.floor(x / 3600), m = Math.floor((x % 3600) / 60), sec = String(x % 60).padStart(2, '0'); return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`; };
+const spkName = (mt, i) => (i == null ? '' : mt.names?.[i] || `Спикер ${i + 1}`);
+function meetingKeys(n) {
+  if (n.stream) return (n.frags || []).filter((f) => f.hasAudio).map((f) => clipKey(n, f));
+  return [...(n.hasAudio ? [n.id] : []), ...(n.clips || []).filter((c) => c.hasAudio).map((c) => clipKey(n, c))];
+}
+function meetingBtnLabel(n) {
+  const mt = n.meeting;
+  if (mt?.segs) return '📝 Расшифровка встречи';
+  if (mt?.pc && pcActive(mt)) return '📝 Расшифровка встречи (ждёт ПК)';
+  return '📝 Расшифровать как встречу';
+}
+function wavHeader(bytes) {
+  const v = new DataView(new ArrayBuffer(44)), w = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + bytes, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, bytes, true);
+  return v.buffer;
+}
+async function isOurWav(b) {
+  const v = new DataView(await b.slice(0, 44).arrayBuffer());
+  return v.byteLength === 44 && v.getUint32(0) === 0x52494646 && v.getUint32(24, true) === 16000 && v.getUint16(22, true) === 1 && v.getUint16(34, true) === 16;
+}
+// Склейка без чтения в память: Blob из кусков других Blob'ов. Одна запись (в т. ч. файл из Telegram) уходит как есть.
+async function meetingBlob(n, keys = n.meeting?.parts?.map((p) => p.key) || meetingKeys(n)) {
+  const blobs = [];
+  for (const k of keys) { const b = await DB.get('audio', k); if (b) blobs.push(b); }
+  if (!blobs.length) return null;
+  if (blobs.length === 1) return blobs[0];
+  for (const b of blobs) if (!(await isOurWav(b))) throw new Error('одна из записей — файл, а не запись приложения; такие пока не склеиваются');
+  const data = blobs.map((b) => b.slice(44)), bytes = data.reduce((a, b) => a + b.size, 0);
+  return new Blob([wavHeader(bytes), ...data], { type: 'audio/wav' });
+}
+async function meetingParts(n) {
+  const parts = []; let t = 0;
+  for (const key of meetingKeys(n)) {
+    const b = await DB.get('audio', key); if (!b) continue;
+    const dur = (await isOurWav(b)) ? (b.size - 44) / 32000 : 0;
+    parts.push({ key, start: t, dur }); t += dur;
+  }
+  return parts;
+}
+function applyMeetingResult(n, res) {
+  const mt = n.meeting;
+  if (res.error) { mt.pc = { ...mt.pc, state: 'error', err: res.error }; return 'error'; }
+  // старая программа на ПК (до 1.3) не знает режима встречи и присылает просто текст
+  if (!res.segments && res.text) { res.segments = [{ s: 0, e: res.audioSec || 0, spk: null, text: res.text }]; res.diarError = 'программа на компьютере старая — обновите её, тогда будут время и говорящие'; }
+  Object.assign(mt, { segs: res.segments || [], nspk: res.speakers || 0, audioSec: res.audioSec, secs: res.secs, model: res.model, diarError: res.diarError || '' });
+  mt.pc = { ...mt.pc, state: 'done', doneAt: Date.now(), model: res.model, device: res.device };
+  return 'meeting';
+}
+function askSpeakers(cb) {
+  sheet(`<div class="sec" style="margin-top:0">Сколько человек говорит?</div>
+    <div class="small" style="margin-bottom:8px">Компьютер расшифрует всю запись: время каждой реплики и кто говорит. Имена можно будет поменять.</div>
+    ${[[2, '2 человека'], [3, '3 человека'], [4, '4 человека'], [0, 'Не знаю — определить самому'], [1, 'Один (только текст со временем)']].map(([v, l]) => `<button class="item" data-spk="${v}">${l}</button>`).join('')}`,
+  (el, close) => el.querySelectorAll('[data-spk]').forEach((b) => (b.onclick = () => { close(); cb(+b.dataset.spk); })));
+}
+async function sendMeeting(n, speakers) {
+  if (!pcOn()) { toast('Сначала подключите Яндекс Диск в настройках'); location.hash = '#/settings'; return; }
+  const parts = await meetingParts(n);
+  if (!parts.length) { toast('У записи нет сохранённого аудио'); return; }
+  const prev = n.meeting || {};
+  n.meeting = { id: 'meet', names: prev.names || {}, speakers, parts, pc: { state: 'outbox', sentAt: Date.now() } };
+  if (prev.segs) n.meeting.prevSegs = prev.segs; // прежняя расшифровка видна, пока не придёт новая
+  saveNote(n); trace(`встреча: в очередь ${n.id}, частей ${parts.length}, ${Math.round(parts.reduce((a, p) => a + p.dur, 0) / 60)} мин`);
+  toast(pcOnlineText().on ? 'Отправляю запись на компьютер…' : 'Компьютер не отвечает — задание будет ждать в очереди');
+  pcSync();
+}
+function openMeeting(n) {
+  if (n.meeting) { location.hash = '#/m/' + encodeURIComponent(n.id); return; }
+  askSpeakers(async (k) => { await sendMeeting(n, k); location.hash = '#/m/' + encodeURIComponent(n.id); });
+}
+function meetingStatusHTML(n) {
+  const mt = n.meeting, p = mt?.pc; if (!p) return '';
+  if (p.state === 'error') return `<div class="warnbox">Компьютер не смог расшифровать: ${esc(p.err || 'ошибка')}. <a data-mact="retry">Отправить ещё раз</a></div>`;
+  if (!pcActive(mt)) return mt.diarError ? `<div class="small" style="margin:6px 0">Говорящих разделить не удалось (${esc(mt.diarError)}), текст со временем есть.</div>` : '';
+  const key = clipKey(n, mt), pr = PC.progress?.[key], on = pcOnlineText();
+  const mins = Math.round((mt.parts || []).reduce((a, x) => a + x.dur, 0) / 60);
+  const what = p.state === 'outbox' ? `Отправляю запись на Яндекс Диск${mins ? ` (${mins} мин, ~${Math.round(mins * 1.9)} МБ)` : ''}… Не закрывайте приложение, пока не отправится.`
+    : pr?.progress != null ? `Компьютер ${pr.stage === 'speakers' ? 'разделяет говорящих' : 'расшифровывает'}: ${Math.round(pr.progress * 100)}%`
+    : PC.working?.has(key) ? 'Компьютер начал расшифровку…'
+    : on.on ? 'В очереди, компьютер в сети.' : `${on.text} Задание ждёт в очереди.`;
+  return `<div class="warnbox">🖥 ${esc(what)}${pr?.progress != null ? `<div class="progress"><i style="width:${Math.round(pr.progress * 100)}%"></i></div>` : ''}${PC.err ? `<div class="small" style="margin-top:4px">Последняя ошибка: ${esc(PC.err)}</div>` : ''}
+    <div class="btns" style="margin-top:8px"><button class="btn" data-mact="check">Проверить сейчас</button><button class="btn" data-mact="cancel">Отменить</button></div></div>`;
+}
+function bindMeetingStatus(n) {
+  app.querySelectorAll('[data-mact]').forEach((b) => (b.onclick = async () => {
+    const a = b.dataset.mact, mt = n.meeting;
+    if (a === 'check') { toast('Проверяю…'); pcSync(); }
+    else if (a === 'retry') sendMeeting(n, mt.speakers || 0);
+    else if (a === 'cancel') {
+      await cancelPC(n, mt);
+      if (mt.prevSegs) { n.meeting = { ...mt, segs: mt.prevSegs, pc: { state: 'done' } }; delete n.meeting.prevSegs; } else delete n.meeting;
+      saveNote(n);
+      if (n.meeting) renderMeeting(n.id); else history.back();
+    }
+  }));
+}
+function meetingText(n, withTime = true) {
+  const mt = n.meeting, segs = mt.segs || [];
+  return segs.map((g) => `${withTime ? `[${fmtTs(g.s)}] ` : ''}${g.spk != null && mt.nspk > 1 ? spkName(mt, g.spk) + ': ' : ''}${g.text}`).join('\n\n');
+}
+function renderMeeting(id) {
+  const n = notes.find((x) => x.id === id);
+  if (!n?.meeting) { app.innerHTML = '<div class="wrap empty">Расшифровки нет. <a href="#/">На главную</a></div>'; return; }
+  const mt = n.meeting, segs = mt.segs || mt.prevSegs || [], multi = (mt.nspk || 0) > 1;
+  const back = n.stream ? '#/s/' + encodeURIComponent(n.id) : '#/n/' + encodeURIComponent(n.id);
+  app.innerHTML = `
+  <header class="top"><div class="wrap row"><a class="iconbtn" href="${back}" aria-label="Назад">${I.back}</a>
+    <div class="grow small">📝 Встреча · ${esc(titleOf(n))}${mt.audioSec ? ' · ' + fmtTs(mt.audioSec) : ''}</div></div></header>
+  <main class="wrap" style="padding-bottom:150px">
+    <div id="mstat">${meetingStatusHTML(n)}</div>
+    ${segs.length ? `
+      ${multi ? `<div class="chips" style="flex-wrap:wrap;margin:6px 0">${Array.from({ length: mt.nspk }, (_, i) => `<button class="chip spk${i % 6}" data-ren="${i}">${esc(spkName(mt, i))} ✎</button>`).join('')}</div>
+        <div class="small" style="margin-bottom:8px">Нажмите на имя, чтобы переименовать. Нажмите на время — запись включится с этого места.</div>` : '<div class="small" style="margin-bottom:8px">Нажмите на время — запись включится с этого места.</div>'}
+      <div id="msegs">${segs.map((g, i) => `<div class="mseg" data-i="${i}"><a class="ts" data-ts="${g.s}">${fmtTs(g.s)}</a>${multi && g.spk != null ? ` <b class="spk${g.spk % 6}">${esc(spkName(mt, g.spk))}</b>` : ''}<div class="mt">${esc(g.text)}</div></div>`).join('')}</div>
+      <div class="btns" style="margin-top:16px"><button class="btn" id="mcopy">📋 Скопировать</button><button class="btn" id="mnote">➜ Сохранить как заметку</button><button class="btn" id="mredo">↻ Расшифровать заново</button><button class="btn danger" id="mdel">Удалить расшифровку</button></div>`
+    : pcActive(mt) ? '' : '<div class="empty">Расшифровки пока нет.</div>'}
+  </main>
+  ${segs.length ? '<div class="mplayer"><audio id="maudio" controls preload="none"></audio></div>' : ''}`;
+  bindMeetingStatus(n);
+  if (!segs.length) return;
+  const au = $('#maudio');
+  let loaded = false;
+  const load = async () => {
+    if (loaded) return true;
+    try { const b = await meetingBlob(n); if (!b) { toast('Аудио не найдено'); return false; } au.src = URL.createObjectURL(b); loaded = true; return true; }
+    catch (e) { toast('Не удалось открыть аудио: ' + (e.message || e), 4000); return false; }
+  };
+  au.onplay = () => load();
+  load();
+  app.querySelectorAll('[data-ts]').forEach((a) => (a.onclick = async () => {
+    if (!(await load())) return;
+    const t = +a.dataset.ts, go = () => { au.currentTime = Math.max(0, t - 0.3); au.play().catch(() => {}); };
+    if (au.readyState >= 1) go(); else au.addEventListener('loadedmetadata', go, { once: true });
+  }));
+  let cur = -1;
+  au.ontimeupdate = () => {
+    const t = au.currentTime; let i = segs.findIndex((g) => t >= g.s - 0.3 && t < g.e + 0.5);
+    if (i === cur) return;
+    app.querySelector('.mseg.cur')?.classList.remove('cur'); cur = i;
+    if (i >= 0) app.querySelector(`.mseg[data-i="${i}"]`)?.classList.add('cur');
+  };
+  app.querySelectorAll('[data-ren]').forEach((b) => (b.onclick = () => {
+    const i = +b.dataset.ren, v = prompt('Имя говорящего:', spkName(mt, i)); if (!v?.trim()) return;
+    mt.names = { ...(mt.names || {}), [i]: v.trim() }; saveNote(n); const keep = scrollY; renderMeeting(id); scrollTo(0, keep);
+  }));
+  $('#mcopy').onclick = async () => toast(await copyText(meetingText(n)) ? 'Расшифровка скопирована' : 'Не удалось скопировать');
+  $('#mnote').onclick = () => {
+    const m = { id: uid(), createdAt: Date.now(), updatedAt: Date.now(), title: 'Встреча: ' + titleOf(n), tags: [], projectId: n.projectId || null, status: 'done', segTexts: null, prefix: '' };
+    m.text = meetingText(n) + `\n\nРасшифровка записи [[${titleOf(n)}]]`;
+    notes.unshift(m); saveNote(m); toast('Заметка создана'); location.hash = '#/n/' + encodeURIComponent(m.id);
+  };
+  $('#mredo').onclick = () => askSpeakers((k) => { sendMeeting(n, k); renderMeeting(id); });
+  $('#mdel').onclick = async () => { if (!confirm('Удалить расшифровку встречи? Аудио и заметка останутся.')) return; delete n.meeting; saveNote(n); location.hash = back; };
+}
+
 /* ---- Экраны ---- */
 function renderStreams() {
   const list = streams();
@@ -1253,6 +1420,7 @@ function renderStream(id, scrollNew) {
   <main class="wrap" style="padding-bottom:130px">
     <input class="title-in" id="stitle" value="${esc(s.title)}">
     ${nNew > 1 || (pcOn() && nCan) ? `<div class="btns" style="margin:4px 0 10px">${nNew > 1 ? `<button class="btn" id="keepall">✓ Оставить все новые (${nNew})</button>` : ''}${pcOn() && nCan ? `<button class="btn" id="spcall">🖥 Распознать все на ПК (${nCan})</button>` : ''}</div>` : ''}
+    ${fs.some((f) => f.hasAudio) || s.meeting ? `<div class="btns" style="margin:0 0 10px"><button class="btn" id="smeet">${meetingBtnLabel(s)}</button></div>` : ''}
     ${pcOn() && fs.length && !nCan && fs.some(pcDone) ? `<div class="small" style="margin:0 0 10px">🖥 ✓ — распознано на компьютере.</div>` : ''}
     ${fs.length ? '' : '<div class="empty">Пока пусто. Нажмите красную кнопку и говорите подряд; между мыслями нажимайте «Следующая мысль».</div>'}
     ${fs.map((f, i) => `<div class="card frag${f.isNew ? ' new' : ''}" data-frag="${f.id}">
@@ -1284,6 +1452,7 @@ function renderStream(id, scrollNew) {
     for (const n of notes) if (n !== s && re.test(n.text || '')) { n.text = n.text.replace(re, '[[' + nv + '$1'); saveNote(n); }
   };
   const fab = $('#sfab'); if (fab) fab.onclick = () => startStream(s);
+  const sm = $('#smeet'); if (sm) sm.onclick = () => openMeeting(s);
   const pa = $('#spcall'); if (pa) pa.onclick = () => {
     const list = fs.filter(pcCan); if (!list.length) return;
     for (const f of list) f.pc = { state: 'outbox', sentAt: Date.now() };
@@ -1341,6 +1510,7 @@ function route() {
   let m;
   if ((m = h.match(/^\/n\/(.+)$/))) return { name: 'note', id: decodeURIComponent(m[1]) };
   if ((m = h.match(/^\/s\/(.+)$/))) return { name: 'stream', id: decodeURIComponent(m[1]) };
+  if ((m = h.match(/^\/m\/(.+)$/))) return { name: 'meeting', id: decodeURIComponent(m[1]) };
   if (h === '/streams') return { name: 'streams' };
   if (h === '/settings') return { name: 'settings' };
   if (h === '/projects') return { name: 'projects' };
@@ -1350,6 +1520,7 @@ function render() {
   const r = route();
   if (r.name === 'note') renderNote(r.id);
   else if (r.name === 'stream') renderStream(r.id);
+  else if (r.name === 'meeting') renderMeeting(r.id);
   else if (r.name === 'streams') renderStreams();
   else if (r.name === 'settings') renderSettings();
   else if (r.name === 'projects') renderProjects();
@@ -1426,7 +1597,7 @@ function renderList() {
       <div class="meta"><span>${fmtDate(n.createdAt)}</span>${n.source === 'file' ? '<span>📎 файл</span>' : ''}${n.duration ? `<span>${fmtDur(n.duration)}</span>` : ''}${nc ? `<span>🎙 ${nc}</span>` : ''}
         ${n.projectId ? `<span class="badge">${esc(projName(n.projectId) || '?')}</span>` : ''}
         ${tagsOf(n).slice(0, 4).map((t) => `<span class="tg">#${esc(t)}</span>`).join('')}
-        ${links ? `<span>🔗 ${links}</span>` : ''}${st}${pcs}</div></a>`;
+        ${links ? `<span>🔗 ${links}</span>` : ''}${n.meeting?.segs ? '<span>📝 встреча</span>' : ''}${st}${pcs}</div></a>`;
   }).join('');
 }
 
@@ -1494,6 +1665,7 @@ function renderNote(id) {
     <div class="btns" style="margin-top:10px">
       ${pcCan(n) ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
       ${n.hasAudio && pcDone(n) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере${n.pc.model ? ' (' + esc(n.pc.model) + ')' : ''} · <a id="topcagain">ещё раз</a></span>` : ''}
+      ${n.hasAudio || clips.some((c) => c.hasAudio) || n.meeting ? `<button class="btn" id="nmeet">${meetingBtnLabel(n)}</button>` : ''}
       ${pcOn() && [n, ...clips].filter(pcCan).length > 1 ? `<button class="btn" id="topcall">🖥 Распознать все записи (${[n, ...clips].filter(pcCan).length})</button>` : ''}
       ${n.hasAudio && !IS_IOS && !clips.length ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
       ${clips.length ? '' : '<button class="btn" id="ncopy">📋 Скопировать весь текст</button><button class="btn danger" id="del">Удалить</button>'}
@@ -1554,6 +1726,7 @@ function renderNote(id) {
   const rt = $('#retr'); if (rt) rt.onclick = () => retranscribe(n);
   const tp = $('#topc'); if (tp) tp.onclick = () => sendToPC(n);
   const tpa = $('#topcagain'); if (tpa) tpa.onclick = () => { if (confirm('Распознать на компьютере ещё раз? Если текст не правили, он заменится, прежний останется в «Прежних вариантах».')) { n.pc = null; sendToPC(n); } };
+  const nm = $('#nmeet'); if (nm) nm.onclick = () => openMeeting(n);
   const tpall = $('#topcall'); if (tpall) tpall.onclick = async () => {
     const list = [n, ...clips].filter(pcCan);
     for (const o of list) await sendToPC(n, true, o === n ? undefined : o);

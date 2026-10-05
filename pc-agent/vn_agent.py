@@ -33,7 +33,7 @@ proxy_fix.fix(direct=_DIRECT)
 
 import requests  # noqa: E402  (после настройки прокси)
 
-AGENT_VERSION = '1.2'
+AGENT_VERSION = '1.3'
 API = os.environ.get('VN_YD_API', 'https://cloud-api.yandex.net/v1/disk')
 HOME = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'voice-notes-agent')
 TOKEN_FILE = os.path.join(HOME, 'token.txt')
@@ -48,7 +48,12 @@ DEFAULTS = {
     'heartbeat_sec': 60,
     'unload_after_min': 10,     # выгружать модель из видеопамяти, если заданий нет
     'beam_size': 5,
+    'keep_awake': True,         # не давать Windows уснуть, пока идёт распознавание
 }
+MODELS_DIR = os.path.join(HOME, 'models')
+# Разметка говорящих (sherpa-onnx, без регистрации и без torch): сегментация pyannote 3.0 + «отпечатки голоса» 3D-Speaker
+SEG_URL = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2'
+EMB_URL = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx'
 PROMPT_RU = 'Это голосовая заметка. Я говорю короткими предложениями. Здесь стоят точки, запятые и вопросительные знаки. Всё понятно?'
 
 
@@ -192,6 +197,110 @@ def add_cuda_dlls():
                     pass
 
 
+def keep_awake(on):
+    """Пока идёт распознавание, Windows не уходит в сон (экран при этом гаснет как обычно)."""
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
+def fetch_file(url, dest):
+    tmp = dest + '.part'
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(tmp, 'wb') as f:
+            for chunk in r.iter_content(1 << 16):
+                f.write(chunk)
+    os.replace(tmp, dest)
+
+
+class Diarizer:
+    """Кто когда говорит. Модели (~45 МБ) скачиваются при первой расшифровке встречи."""
+
+    def __init__(self):
+        self.seg = os.path.join(MODELS_DIR, 'sherpa-onnx-pyannote-segmentation-3-0', 'model.onnx')
+        self.emb = os.path.join(MODELS_DIR, os.path.basename(EMB_URL))
+
+    def ensure(self):
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        if not os.path.exists(self.seg):
+            log.info('Скачиваю модель разметки говорящих (7 МБ)…')
+            arc = os.path.join(MODELS_DIR, 'seg.tar.bz2')
+            fetch_file(SEG_URL, arc)
+            import tarfile
+            with tarfile.open(arc) as t:
+                t.extractall(MODELS_DIR)
+            os.remove(arc)
+        if not os.path.exists(self.emb):
+            log.info('Скачиваю модель голосов (40 МБ)…')
+            fetch_file(EMB_URL, self.emb)
+
+    def run(self, audio, speakers=0):
+        """audio — float32 16 кГц; speakers — сколько человек (0 — определить самому).
+        Возвращает [(start, end, speaker)] по времени."""
+        import sherpa_onnx
+        self.ensure()
+        th = max(1, (os.cpu_count() or 4) - 1)
+        cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+            segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+                pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=self.seg), num_threads=th),
+            embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=self.emb, num_threads=th),
+            # порог 0.9 на тестах правильно находит число говорящих, когда оно не задано
+            clustering=sherpa_onnx.FastClusteringConfig(num_clusters=speakers if speakers > 0 else -1, threshold=0.9),
+            min_duration_on=0.3, min_duration_off=0.5)
+        if not cfg.validate():
+            raise RuntimeError('модели разметки говорящих не прочитались')
+        sd = sherpa_onnx.OfflineSpeakerDiarization(cfg)
+        res = sd.process(audio).sort_by_start_time()
+        return [(r.start, r.end, r.speaker) for r in res]
+
+
+def assign_speakers(words, turns):
+    """Каждому слову — говорящего, чей отрезок накрывает середину слова (или ближайшего).
+    Номера говорящих перенумеровываются по порядку появления: 0, 1, 2…"""
+    if not turns:
+        return [None] * len(words)
+    out, j, ren = [], 0, {}
+    for w in words:
+        mid = (w[0] + w[1]) / 2
+        while j + 1 < len(turns) and turns[j][1] < mid:
+            j += 1
+        best, dist = None, 1e9
+        for k in (j - 1, j, j + 1):
+            if 0 <= k < len(turns):
+                a, b, sp = turns[k]
+                d = 0 if a <= mid <= b else min(abs(mid - a), abs(mid - b))
+                if d < dist:
+                    best, dist = sp, d
+        if best not in ren:
+            ren[best] = len(ren)
+        out.append(ren[best])
+    return out
+
+
+def build_utterances(words, spk, max_sec=45):
+    """Слова → реплики: новая реплика при смене говорящего, паузе > 2 с
+    или когда реплика длиннее max_sec и закончилось предложение."""
+    utts = []
+    for (a, b, t), sp in zip(words, spk):
+        u = utts[-1] if utts else None
+        if (u is None or sp != u['spk'] or a - u['e'] > 2
+                or (b - u['s'] > max_sec and re.search(r'[.!?…]$', u['text']))):
+            u = {'s': round(a, 2), 'e': round(b, 2), 'spk': sp, 'text': ''}
+            utts.append(u)
+        u['text'] += t
+        u['e'] = round(b, 2)
+    for u in utts:
+        u['text'] = u['text'].strip()
+        u['text'] = u['text'][:1].upper() + u['text'][1:]
+    return [u for u in utts if u['text']]
+
+
 class Engine:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -253,6 +362,65 @@ class Engine:
         self.last_used = time.time()
         return text, dur, time.time() - t0
 
+    def meeting(self, path, lang, speakers, progress):
+        """Расшифровка встречи: реплики со временем и говорящим."""
+        self.load()
+        t0 = time.time()
+        from faster_whisper import decode_audio
+        audio = decode_audio(path, sampling_rate=16000)
+        dur = len(audio) / 16000
+        try:
+            words = self._words(audio, lang, dur, progress)
+        except Exception as e:
+            if self.device != 'cuda':
+                raise
+            log.info('Ошибка на видеокарте (%s) — повторяю на процессоре', e)
+            self.cuda_failed = True
+            self.model = None
+            self.load()
+            words = self._words(audio, lang, dur, progress)
+        self.last_used = time.time()
+        turns, derr = [], None
+        if speakers != 1 and words:
+            progress(0.97, 'speakers')
+            try:
+                td = time.time()
+                turns = Diarizer().run(audio, speakers)
+                log.info('Разметка говорящих: %d отрезков, %d чел., %.0f с', len(turns), len({t[2] for t in turns}), time.time() - td)
+            except Exception as e:
+                derr = str(e)[:200]
+                log.info('Разметка говорящих не удалась: %s\n%s', e, traceback.format_exc())
+        spk = assign_speakers(words, turns)
+        utts = build_utterances(words, spk)
+        n = len({u['spk'] for u in utts if u['spk'] is not None})
+        return utts, n, derr, dur, time.time() - t0
+
+    def _words(self, audio, lang, dur, progress):
+        ru = lang in ('ru', None, '', 'auto')
+        segs, info = self.model.transcribe(
+            audio, language=None if lang in (None, '', 'auto') else lang, beam_size=self.cfg['beam_size'],
+            vad_filter=True, vad_parameters={'min_silence_duration_ms': 500},
+            initial_prompt=PROMPT_RU if ru else None, word_timestamps=True,
+            # на длинной записи эти настройки не дают Whisper «зациклиться» на тишине
+            condition_on_previous_text=True, compression_ratio_threshold=2.2, no_speech_threshold=0.6,
+            hallucination_silence_threshold=2)
+        words, last, prev = [], 0, None
+        for s in segs:
+            t = s.text.strip()
+            if not t or re.fullmatch(r'[\s.,!?…\-–—]*', t):
+                continue
+            if len(t) < 90 and any(re.search(h, t, re.I) for h in HALL):
+                continue
+            if t == prev:  # повтор — типичная «петля» Whisper
+                continue
+            prev = t
+            for w in s.words or []:
+                words.append((w.start, w.end, w.word))
+            if time.time() - last > 30:
+                progress(min(0.95, s.end / max(dur, 1)), 'text')
+                last = time.time()
+        return words
+
     def _run(self, path, lang):
         ru = lang in ('ru', None, '', 'auto')
         segs, info = self.model.transcribe(
@@ -285,6 +453,7 @@ class Agent:
         self.cfg = cfg
         self.eng = Engine(cfg)
         self.last_beat = 0
+        self.slept = None
         self.ready = False
 
     def setup_dirs(self):
@@ -294,14 +463,35 @@ class Agent:
             self.d.upload_bytes('app:/pc.json', b'{"about": "voice-notes: computer heartbeat in custom_properties"}')
         self.ready = True
 
-    def beat(self, busy=False, force=False):
-        if not force and time.time() - self.last_beat < self.cfg['heartbeat_sec']:
-            return
-        self.d.props('app:/pc.json', {
+    def beat_props(self, busy):
+        p = {
             'seen': int(time.time() * 1000), 'busy': 1 if busy else 0, 'agent': AGENT_VERSION,
             'model': self.eng.name or self.cfg['model'],
             'device': self.eng.device or ('cpu' if self.cfg['device'] == 'cpu' or self.eng.cuda_failed else 'cuda'),
-        })
+        }
+        if self.slept:
+            p['sleptFrom'], p['sleptTo'] = self.slept
+        return p
+
+    def note_gap(self, last_ms, now_ms):
+        """Перерыв в отметках дольше 5 мин — компьютер спал или был выключен: запоминаем когда."""
+        if last_ms and now_ms - last_ms > 5 * 60 * 1000:
+            self.slept = (int(last_ms), int(now_ms))
+            log.info('Компьютер спал или был выключен: %s — %s',
+                     time.strftime('%d.%m %H:%M', time.localtime(last_ms / 1000)), time.strftime('%d.%m %H:%M', time.localtime(now_ms / 1000)))
+
+    def beat(self, busy=False, force=False):
+        if not force and time.time() - self.last_beat < self.cfg['heartbeat_sec']:
+            return
+        if not self.last_beat:  # первый запуск после выключения: перерыв считаем от прошлой отметки
+            try:
+                prev = (self.d.req('GET', '/resources', {'path': 'app:/pc.json', 'fields': 'custom_properties'}, ok404=True) or {}).get('custom_properties') or {}
+                self.note_gap(int(prev.get('seen') or 0), int(time.time() * 1000))
+                if not self.slept and prev.get('sleptFrom'):
+                    self.slept = (int(prev['sleptFrom']), int(prev['sleptTo']))
+            except Exception:
+                pass
+        self.d.props('app:/pc.json', self.beat_props(busy))
         self.last_beat = time.time()
 
     def process(self):
@@ -313,16 +503,31 @@ class Agent:
             log.info('Задание %s (%.1f МБ)', nid, (j.get('size') or 0) / 1e6)
             self.d.props(path, {'status': 'working', 'startedAt': int(time.time() * 1000)})
             self.busy = True
+            if self.cfg.get('keep_awake', True):
+                keep_awake(True)
             self.beat(busy=True, force=True)
             fd, tmp = tempfile.mkstemp(suffix='.wav')
             os.close(fd)
             try:
                 self.d.download_to(path, tmp)
                 try:
-                    text, dur, secs = self.eng.transcribe(tmp, props.get('lang') or 'ru')
-                    res = {'text': text, 'model': self.eng.name, 'device': self.eng.device,
-                           'audioSec': round(dur, 1), 'secs': round(secs, 1), 'at': int(time.time() * 1000)}
-                    log.info('Готово: %.0f с аудио за %.0f с, %d символов', dur, secs, len(text))
+                    if props.get('mode') == 'meeting':
+                        def progress(x, stage, _p=path):
+                            try:
+                                self.d.props(_p, {'progress': round(x, 3), 'stage': stage})
+                            except Exception:
+                                pass
+                        utts, n, derr, dur, secs = self.eng.meeting(tmp, props.get('lang') or 'ru', int(props.get('speakers') or 0), progress)
+                        res = {'mode': 'meeting', 'segments': utts, 'speakers': n, 'model': self.eng.name, 'device': self.eng.device,
+                               'audioSec': round(dur, 1), 'secs': round(secs, 1), 'at': int(time.time() * 1000)}
+                        if derr:
+                            res['diarError'] = derr
+                        log.info('Встреча готова: %.0f мин аудио за %.0f мин, реплик %d, говорящих %d', dur / 60, secs / 60, len(utts), n)
+                    else:
+                        text, dur, secs = self.eng.transcribe(tmp, props.get('lang') or 'ru')
+                        res = {'text': text, 'model': self.eng.name, 'device': self.eng.device,
+                               'audioSec': round(dur, 1), 'secs': round(secs, 1), 'at': int(time.time() * 1000)}
+                        log.info('Готово: %.0f с аудио за %.0f с, %d символов', dur, secs, len(text))
                 except Exception as e:
                     log.info('Не распознано: %s\n%s', e, traceback.format_exc())
                     res = {'error': str(e)[:300], 'at': int(time.time() * 1000)}
@@ -334,6 +539,7 @@ class Agent:
                 except OSError:
                     pass
                 self.busy = False
+                keep_awake(False)
             self.beat(force=True)
         return len(jobs)
 
@@ -353,14 +559,15 @@ class Agent:
         d = Disk(self.token)
 
         def loop():
+            last = time.time()
             while True:
                 time.sleep(self.cfg['heartbeat_sec'])
+                now = time.time()
+                # во сне поток стоит: после пробуждения «прошла минута» оказывается часами
+                self.note_gap(last * 1000, now * 1000)
+                last = now
                 try:
-                    d.props('app:/pc.json', {
-                        'seen': int(time.time() * 1000), 'busy': 1 if self.busy else 0, 'agent': AGENT_VERSION,
-                        'model': self.eng.name or self.cfg['model'],
-                        'device': self.eng.device or ('cpu' if self.cfg['device'] == 'cpu' or self.eng.cuda_failed else 'cuda'),
-                    })
+                    d.props('app:/pc.json', self.beat_props(self.busy))
                 except Exception as e:
                     log.info('Отметка «в сети» не ушла: %s', e.__class__.__name__)
         threading.Thread(target=loop, daemon=True).start()
