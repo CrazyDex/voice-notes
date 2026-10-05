@@ -1,5 +1,5 @@
 import { Recorder, NullRecorder, releaseMic, encodeWav, decodeWav, segmentAll, decodeAudioFile } from './audio.js?v=1.10';
-import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.5';
+import { YDisk, API, PC_ONLINE_MS, ago, diffWords } from './pc.js?v=1.11';
 
 /* ================= Настройки ================= */
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.10';
+const VERSION = '1.11';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -769,7 +769,7 @@ const PC = {
   token: () => ls.get('vn.ydToken', ''),
   disk: () => new YDisk(PC.token(), ls.get('vn.ydApi', API)),
   seen: () => ls.get('vn.pcSeen', null), // {seen, model, device, busy}
-  busy: false, timer: null, dirsOk: false,
+  busy: false, busyAt: 0, timer: null, dirsOk: false,
 };
 const pcOn = () => !!PC.token();
 // pcActive/pcBoxHTML работают и с заметкой, и с отдельной записью журнала (у обеих есть .pc / .pcText)
@@ -787,11 +787,23 @@ function pcUnits() {
   return out;
 }
 function pcOnlineText() {
-  const p = PC.seen();
+  const p = PC.seen(), checked = ls.get('vn.pcChecked', 0);
+  // телефон давно не заглядывал на Диск — сведения о компьютере могут быть устаревшими
+  const stale = checked && Date.now() - checked > 10 * 60 * 1000 ? ` Телефон проверял ${ago(checked)}.` : '';
   if (!p?.seen) return { on: false, text: 'Программа на компьютере ещё ни разу не выходила на связь.' };
   if (Date.now() - p.seen < PC_ONLINE_MS) return { on: true, text: `Компьютер в сети${p.model ? ' · ' + p.model : ''}${p.device ? ' (' + (p.device === 'cuda' ? 'видеокарта' : 'процессор') + ')' : ''}.` };
-  return { on: false, text: `Компьютер выключен (был в сети ${ago(p.seen)}).` };
+  return { on: false, text: `Компьютер не отвечает: был в сети ${ago(p.seen)} (выключен или спит).${stale}` };
 }
+// сон компьютера, который заметила программа на ПК (agent 1.3+): «спал 23:10–02:40»
+function pcSleepText() {
+  const p = PC.seen(); if (!p?.sleptFrom || !p?.sleptTo) return '';
+  const t = (x) => new Date(x).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  return `Последний раз компьютер спал или был выключен: ${t(p.sleptFrom)} — ${t(p.sleptTo)}.`;
+}
+// распознано ли уже на ПК (и не ждёт ли решения)
+const pcDone = (o) => o.pc?.state === 'done';
+const pcCan = (o) => o.hasAudio && !pcActive(o) && o.pc?.state !== 'ready' && !pcDone(o);
+const PC_OK = '<span class="pcok" title="Распознано на компьютере">🖥 ✓</span>';
 function addVersion(n, label, text) {
   if (!text?.trim()) return;
   n.versions = n.versions || [];
@@ -869,10 +881,18 @@ function showDiff(a, b, title) {
 }
 // Синхронизация: загрузить задания из «исходящих», забрать готовые результаты, обновить «ПК в сети»
 async function pcSync() {
-  if (!pcOn() || PC.busy) return;
-  PC.busy = true;
+  // запрос, замороженный iOS при сворачивании, не должен навсегда блокировать синхронизацию
+  if (!pcOn() || (PC.busy && Date.now() - PC.busyAt < 20 * 60 * 1000)) return;
+  PC.busy = true; PC.busyAt = Date.now();
   const d = PC.disk();
   try {
+    // сначала отметка «ПК в сети»: она нужна, даже если отправка записей не удалась
+    try {
+      const m = await d.meta('app:/pc.json');
+      const p = m.custom_properties || {};
+      if (p.seen) ls.set('vn.pcSeen', { seen: +p.seen, model: p.model, device: p.device, busy: p.busy, sleptFrom: +p.sleptFrom || 0, sleptTo: +p.sleptTo || 0 });
+      ls.set('vn.pcChecked', Date.now());
+    } catch (e) { if (e.status !== 404) throw e; }
     if (!PC.dirsOk) { await d.mkdir('app:/jobs'); await d.mkdir('app:/results'); PC.dirsOk = true; }
     for (const { n, o, key } of pcUnits().filter((u) => u.o.pc.state === 'outbox')) {
       const blob = await DB.get('audio', key);
@@ -882,11 +902,6 @@ async function pcSync() {
       o.pc = { ...o.pc, state: 'queued' }; saveNote(n); onNoteChanged(n);
       trace(`ПК: загружено ${key} (${(blob.size / 1e6).toFixed(1)} МБ)`);
     }
-    try {
-      const m = await d.meta('app:/pc.json');
-      const p = m.custom_properties || {};
-      if (p.seen) ls.set('vn.pcSeen', { seen: +p.seen, model: p.model, device: p.device, busy: p.busy });
-    } catch (e) { if (e.status !== 404) throw e; }
     const jobsOnDisk = await d.list('app:/jobs');
     PC.working = new Set(jobsOnDisk.filter((f) => f.custom_properties?.status === 'working').map((f) => f.name.replace(/\.wav$/, '')));
     for (const f of await d.list('app:/results')) {
@@ -904,7 +919,7 @@ async function pcSync() {
     }
     PC.err = '';
   } catch (e) {
-    PC.err = e.status === 401 ? 'Ключ Яндекс Диска недействителен — получите новый в настройках' : (e.message || String(e));
+    PC.err = e.status === 401 ? 'Ключ Яндекс Диска недействителен — получите новый в настройках' : e.name === 'TimeoutError' || e.name === 'AbortError' ? 'Яндекс Диск не ответил вовремя (нет связи?)' : (e.message || String(e));
     trace('ПК: ошибка ' + PC.err);
   } finally {
     PC.busy = false;
@@ -1176,6 +1191,7 @@ async function fragToNote(s, f) {
   if (f.hasAudio) {
     const blob = await DB.get('audio', clipKey(s, f));
     if (blob) { await DB.put('audio', blob, n.id); n.hasAudio = true; n.duration = f.duration; }
+    if (pcDone(f)) n.pc = { state: 'done', model: f.pc.model, device: f.pc.device, doneAt: f.pc.doneAt };
     await DB.del('audio', clipKey(s, f));
   }
   notes.unshift(n); saveNote(n);
@@ -1227,7 +1243,7 @@ function renderStreams() {
 function renderStream(id, scrollNew) {
   const s = notes.find((x) => x.id === id);
   if (!s) { app.innerHTML = '<div class="wrap empty">Поток не найден. <a href="#/streams">К потокам</a></div>'; return; }
-  const fs = s.frags || [], nNew = fs.filter((f) => f.isNew).length;
+  const fs = s.frags || [], nNew = fs.filter((f) => f.isNew).length, nCan = fs.filter(pcCan).length;
   const edit = renderStream.edit || null;
   app.innerHTML = `
   <header class="top"><div class="wrap row">
@@ -1236,10 +1252,11 @@ function renderStream(id, scrollNew) {
   </div></header>
   <main class="wrap" style="padding-bottom:130px">
     <input class="title-in" id="stitle" value="${esc(s.title)}">
-    ${nNew > 1 ? `<div class="btns" style="margin:4px 0 10px"><button class="btn" id="keepall">✓ Оставить все новые (${nNew})</button></div>` : ''}
+    ${nNew > 1 || (pcOn() && nCan) ? `<div class="btns" style="margin:4px 0 10px">${nNew > 1 ? `<button class="btn" id="keepall">✓ Оставить все новые (${nNew})</button>` : ''}${pcOn() && nCan ? `<button class="btn" id="spcall">🖥 Распознать все на ПК (${nCan})</button>` : ''}</div>` : ''}
+    ${pcOn() && fs.length && !nCan && fs.some(pcDone) ? `<div class="small" style="margin:0 0 10px">🖥 ✓ — распознано на компьютере.</div>` : ''}
     ${fs.length ? '' : '<div class="empty">Пока пусто. Нажмите красную кнопку и говорите подряд; между мыслями нажимайте «Следующая мысль».</div>'}
     ${fs.map((f, i) => `<div class="card frag${f.isNew ? ' new' : ''}" data-frag="${f.id}">
-      <div class="meta" style="margin:0 0 6px"><b>${i + 1}.</b><span>${esc(fragTime(f))}</span>${f.duration ? `<span>${fmtDur(f.duration)}</span>` : ''}${f.isNew ? '<span style="color:var(--accent)">новая</span>' : ''}${f.pending ? '<span>⏳ распознаётся</span>' : ''}</div>
+      <div class="meta" style="margin:0 0 6px"><b>${i + 1}.</b><span>${esc(fragTime(f))}</span>${f.duration ? `<span>${fmtDur(f.duration)}</span>` : ''}${f.isNew ? '<span style="color:var(--accent)">новая</span>' : ''}${f.pending ? '<span>⏳ распознаётся</span>' : ''}${pcDone(f) ? PC_OK : ''}</div>
       ${edit === f.id ? `<textarea class="field" data-fedit="${f.id}" style="min-height:120px">${esc(f.text || '')}</textarea>`
         : `<div class="ftext" data-ftext="${f.id}">${esc(f.text || '') || '<span class="small">без текста</span>'}</div>`}
       <div data-faudio="${f.id}">${f.hasAudio ? `<button class="btn" data-fplay="${f.id}" style="margin-top:8px">▶ Аудио</button>` : ''}</div>
@@ -1248,7 +1265,7 @@ function renderStream(id, scrollNew) {
         <button class="btn primary" data-fnote="${f.id}">➜ В заметку</button>
         ${f.isNew ? `<button class="btn" data-fkeep="${f.id}">✓ Оставить</button>` : ''}
         <button class="btn" data-fed="${f.id}">${edit === f.id ? 'Готово' : '✎'}</button>
-        ${f.hasAudio && pcOn() && !pcActive(f) && f.pc?.state !== 'ready' ? `<button class="btn" data-ftopc="${f.id}" title="Распознать на ПК">🖥</button>` : ''}
+        ${pcOn() && pcCan(f) ? `<button class="btn" data-ftopc="${f.id}" title="Распознать на ПК">🖥</button>` : ''}
         <button class="btn danger" data-fdel="${f.id}">🗑</button>
       </div></div>`).join('<div style="height:10px"></div>')}
     <div class="btns" style="margin-top:18px"><button class="btn" id="scopy">📋 Скопировать весь текст</button><button class="btn danger" id="sdel">Удалить поток</button></div>
@@ -1267,6 +1284,12 @@ function renderStream(id, scrollNew) {
     for (const n of notes) if (n !== s && re.test(n.text || '')) { n.text = n.text.replace(re, '[[' + nv + '$1'); saveNote(n); }
   };
   const fab = $('#sfab'); if (fab) fab.onclick = () => startStream(s);
+  const pa = $('#spcall'); if (pa) pa.onclick = () => {
+    const list = fs.filter(pcCan); if (!list.length) return;
+    for (const f of list) f.pc = { state: 'outbox', sentAt: Date.now() };
+    saveNote(s); redraw();
+    toast(`${pcOnlineText().on ? 'Отправляю на компьютер' : 'Компьютер не отвечает — задания будут ждать в очереди'}: ${list.length}`); pcSync();
+  };
   const ka = $('#keepall'); if (ka) ka.onclick = () => { fs.forEach((f) => (f.isNew = false)); saveNote(s); redraw(); };
   app.querySelectorAll('[data-fkeep]').forEach((b) => (b.onclick = () => { get(b.dataset.fkeep).isNew = false; saveNote(s); redraw(); }));
   app.querySelectorAll('[data-fnote]').forEach((b) => (b.onclick = async () => { if (await fragToNote(s, get(b.dataset.fnote))) redraw(); }));
@@ -1393,7 +1416,8 @@ function renderList() {
   if (!list.length) { el.innerHTML = '<div class="empty">Ничего не найдено</div>'; return; }
   el.innerHTML = list.map((n) => {
     const st = n.status === 'transcribing' || n.status === 'recording' ? '<span>⏳ распознаётся</span>' : n.status === 'error' ? '<span style="color:var(--accent)">⚠︎ ошибка</span>' : '';
-    const pcs = pcAnyActive(n) ? '<span>🖥 ждёт ПК</span>' : pcAnyReady(n) ? '<span style="color:var(--warn)">🖥 готово, выберите</span>' : '';
+    const pcs = pcAnyActive(n) ? '<span>🖥 ждёт ПК</span>' : pcAnyReady(n) ? '<span style="color:var(--warn)">🖥 готово, выберите</span>'
+      : pcDone(n) || (n.clips || []).some(pcDone) ? PC_OK : '';
     const nc = (n.clips || []).length;
     const links = linksOf(n).length;
     return `<a class="card" href="#/n/${encodeURIComponent(n.id)}">
@@ -1468,16 +1492,19 @@ function renderNote(id) {
     <div class="sec">Аудио${clips.length ? ' · записей: ' + (clips.length + (n.hasAudio ? 1 : 0)) : ''}</div>
     ${n.hasAudio || !clips.length ? `${clips.length ? '<div class="small" style="margin-bottom:4px">Первая запись</div>' : ''}<div id="naudio" class="small">${n.hasAudio ? 'Загрузка…' : 'Не сохранено'}</div>` : ''}
     <div class="btns" style="margin-top:10px">
-      ${n.hasAudio && !pcActive(n) && n.pc?.state !== 'ready' ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
+      ${pcCan(n) ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
+      ${n.hasAudio && pcDone(n) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере${n.pc.model ? ' (' + esc(n.pc.model) + ')' : ''} · <a id="topcagain">ещё раз</a></span>` : ''}
+      ${pcOn() && [n, ...clips].filter(pcCan).length > 1 ? `<button class="btn" id="topcall">🖥 Распознать все записи (${[n, ...clips].filter(pcCan).length})</button>` : ''}
       ${n.hasAudio && !IS_IOS && !clips.length ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
       ${clips.length ? '' : '<button class="btn" id="ncopy">📋 Скопировать весь текст</button><button class="btn danger" id="del">Удалить</button>'}
     </div>
     ${clips.map((c) => `<div class="card" style="margin-top:10px" data-clip="${c.id}">
-      <div class="meta" style="margin:0 0 4px"><b>🎙 ${esc(clipTime(c))}</b>${c.duration ? `<span>${fmtDur(c.duration)}</span>` : ''}${clipRange(n, c) ? '' : '<span>раздел в тексте удалён</span>'}</div>
+      <div class="meta" style="margin:0 0 4px"><b>🎙 ${esc(clipTime(c))}</b>${c.duration ? `<span>${fmtDur(c.duration)}</span>` : ''}${pcDone(c) ? PC_OK : ''}${clipRange(n, c) ? '' : '<span>раздел в тексте удалён</span>'}</div>
       <div data-caudio="${c.id}" class="small">${c.hasAudio ? 'Загрузка…' : 'Аудио не сохранено'}</div>
       <div data-cpcbox="${c.id}">${pcBoxHTML(c, c.id)}</div>
       <div class="btns" style="margin-top:8px">
-        ${c.hasAudio && !pcActive(c) && c.pc?.state !== 'ready' ? `<button class="btn" data-ctopc="${c.id}">🖥 Распознать на ПК</button>` : ''}
+        ${pcCan(c) ? `<button class="btn" data-ctopc="${c.id}">🖥 Распознать на ПК</button>` : ''}
+        ${c.hasAudio && pcDone(c) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере · <a data-ctopcagain="${c.id}">ещё раз</a></span>` : ''}
         <button class="btn danger" data-cdel="${c.id}">Удалить аудио</button>
       </div></div>`).join('')}
     ${clips.length ? '<div class="btns" style="margin-top:14px"><button class="btn" id="ncopy">📋 Скопировать весь текст</button><button class="btn danger" id="del">Удалить заметку</button></div>' : ''}
@@ -1526,6 +1553,12 @@ function renderNote(id) {
   bindSug(n, false);
   const rt = $('#retr'); if (rt) rt.onclick = () => retranscribe(n);
   const tp = $('#topc'); if (tp) tp.onclick = () => sendToPC(n);
+  const tpa = $('#topcagain'); if (tpa) tpa.onclick = () => { if (confirm('Распознать на компьютере ещё раз? Если текст не правили, он заменится, прежний останется в «Прежних вариантах».')) { n.pc = null; sendToPC(n); } };
+  const tpall = $('#topcall'); if (tpall) tpall.onclick = async () => {
+    const list = [n, ...clips].filter(pcCan);
+    for (const o of list) await sendToPC(n, true, o === n ? undefined : o);
+    toast(`${pcOnlineText().on ? 'Отправляю на компьютер' : 'Компьютер не отвечает — задания будут ждать в очереди'}: ${list.length}`);
+  };
   bindPCBox(n); bindVersions(n);
   $('#ncopy').onclick = async () => {
     const ta2 = $('#ntext'); if (ta2) n.text = ta2.value;
@@ -1548,6 +1581,10 @@ function renderNote(id) {
     });
   }
   app.querySelectorAll('[data-ctopc]').forEach((b) => (b.onclick = () => sendToPC(n, false, clips.find((c) => c.id === b.dataset.ctopc))));
+  app.querySelectorAll('[data-ctopcagain]').forEach((b) => (b.onclick = () => {
+    const c = clips.find((x) => x.id === b.dataset.ctopcagain); if (!c || !confirm('Распознать эту запись на компьютере ещё раз?')) return;
+    c.pc = null; sendToPC(n, false, c);
+  }));
   app.querySelectorAll('[data-cdel]').forEach((b) => (b.onclick = async () => {
     const c = clips.find((x) => x.id === b.dataset.cdel); if (!c) return;
     if (!confirm('Удалить аудио этой записи? Её текст в заметке останется.')) return;
@@ -1760,6 +1797,7 @@ function pcSettingsHTML() {
     <div class="btns" style="margin-top:8px"><button class="btn primary" id="ydsave">Подключить</button></div>`;
   const on = pcOnlineText();
   return `<div class="status"><span class="dot ${on.on ? 'ok' : 'warn'}"></span>${esc(on.text)}</div>
+    ${pcSleepText() ? `<div class="small" style="margin-top:4px">${esc(pcSleepText())}</div>` : ''}
     <div class="small" id="ydwho" style="margin-top:4px">Яндекс Диск подключён.${PC.err ? ' Последняя ошибка: ' + esc(PC.err) : ''}</div>
     <div style="height:10px"></div>${'<div class="seg">' + [[false, 'Только по кнопке'], [true, 'Все новые записи']].map(([v, l]) => `<button data-k="pcAuto" data-v="${v}" class="${S.pcAuto === v ? 'on' : ''}">${l}</button>`).join('') + '</div>'}
     <div class="small" style="margin-top:6px">«Все новые записи» — каждая запись и импортированный файл сами уходят на компьютер. Текст, который вы успели исправить, не заменяется: появится плашка с выбором.</div>

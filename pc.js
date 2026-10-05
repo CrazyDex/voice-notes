@@ -6,6 +6,10 @@
 export const API = 'https://cloud-api.yandex.net/v1/disk';
 export const PC_ONLINE_MS = 3 * 60 * 1000;
 
+// iOS может «заморозить» запрос, когда приложение сворачивают: без тайм-аута он висит вечно,
+// синхронизация больше не запускается и «ПК в сети» не обновляется часами
+const withTimeout = (ms) => (typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined);
+
 export class YDisk {
   constructor(token, api = API) { this.token = token; this.api = api; }
   async req(method, path, params = {}, body) {
@@ -14,6 +18,7 @@ export class YDisk {
       method,
       headers: { Authorization: 'OAuth ' + this.token, ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
+      signal: withTimeout(30000),
     });
     if (r.status === 204) return null;
     const j = await r.json().catch(() => null);
@@ -39,12 +44,13 @@ export class YDisk {
   async upload(path, blob) {
     const { href, method } = await this.req('GET', '/resources/upload', { path, overwrite: 'true' });
     // ссылка загрузки уже подписана — без заголовка Authorization (иначе браузер упрётся в CORS)
-    const r = await fetch(href, { method: method || 'PUT', body: blob });
+    // ~100 КБ/с в худшем случае, но не меньше 2 мин
+    const r = await fetch(href, { method: method || 'PUT', body: blob, signal: withTimeout(Math.max(120000, (blob.size || 0) / 100)) });
     if (!r.ok && r.status !== 201 && r.status !== 202) throw new Error('загрузка: HTTP ' + r.status);
   }
   async download(path) {
     const { href } = await this.req('GET', '/resources/download', { path });
-    const r = await fetch(href, { referrerPolicy: 'no-referrer' });
+    const r = await fetch(href, { referrerPolicy: 'no-referrer', signal: withTimeout(120000) });
     if (!r.ok) throw new Error('скачивание: HTTP ' + r.status);
     return r.text();
   }
