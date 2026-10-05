@@ -59,6 +59,8 @@ h1{font-size:26px;margin:4px 0 8px;letter-spacing:-.02em}
 .mseg b{font-size:13px}.mseg .mt{margin-top:2px}
 .spk0{color:#2f6fdb}.spk1{color:#c2410c}.spk2{color:#2f9e5b}.spk3{color:#7a4fd6}.spk4{color:#b8860b}.spk5{color:#d6336c}
 .chip.spk0,.chip.spk1,.chip.spk2,.chip.spk3,.chip.spk4,.chip.spk5{font-weight:600}
+.mseg .mk{font-weight:600;color:var(--warn)}.mseg .unsure{background:color-mix(in srgb,var(--warn) 18%,transparent);border-radius:4px}
+.mseg .chk{display:inline-block;font-size:12px;font-weight:700;color:#fff;background:var(--accent);border-radius:999px;padding:1px 8px;margin:0 2px;cursor:pointer;white-space:nowrap}
 .mplayer{position:fixed;left:0;right:0;bottom:0;padding:10px 16px calc(var(--sab) + 10px);background:var(--bg);border-top:1px solid var(--surface2);z-index:10}
 .mplayer audio{width:100%}
 .fab2{position:fixed;left:calc(50% + 62px);bottom:calc(var(--sab) + 32px);width:56px;height:56px;border-radius:50%;background:var(--surface2);color:var(--text);display:grid;place-items:center;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.15)}.fab2 svg{width:24px;height:24px}
@@ -122,7 +124,7 @@ audio{width:100%;margin-top:6px}
 </head>
 <body>
 <div id="app"></div>
-<script type="module" src="app.js?v=1.14"></script>
+<script type="module" src="app.js?v=1.15"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

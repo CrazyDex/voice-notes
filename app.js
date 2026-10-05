@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.14';
+const VERSION = '1.15';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -1361,14 +1361,30 @@ function bindMeetingStatus(n) {
     }
   }));
 }
+// Пометки трудных мест от программы на ПК (1.4+): [НЕРАЗБОРЧИВО, 0:11–0:17], [?сомнительные слова?],
+// (ЧЕЛОВЕК ПРОВЕРЬ) — у реплики g.chk = время каждой такой пометки по порядку
+const CHECK_RE = /\(ЧЕЛОВЕК ПРОВЕРЬ\)/g;
+function segHTML(g) {
+  let k = 0;
+  return esc(g.text)
+    .replace(/\[\?([^\]]*?)\?\]/g, '<span class="unsure" title="Компьютер не уверен в этих словах">[?$1?]</span>')
+    .replace(/\[([А-ЯЁ][А-ЯЁ ,–:0-9-]*)\]/g, '<span class="mk">[$1]</span>')
+    .replace(CHECK_RE, () => `<a class="chk" data-chk="${g.chk?.[k++] ?? g.s}">ЧЕЛОВЕК ПРОВЕРЬ ▶</a>`);
+}
+const segChecks = (g) => (g.text.match(CHECK_RE) || []).map((_, i) => g.chk?.[i] ?? g.s);
 function meetingText(n, withTime = true) {
   const mt = n.meeting, segs = mt.segs || [];
-  return segs.map((g) => `${withTime ? `[${fmtTs(g.s)}] ` : ''}${g.spk != null && mt.nspk > 1 ? spkName(mt, g.spk) + ': ' : ''}${g.text}`).join('\n\n');
+  const body = segs.map((g) => `${withTime ? `[${fmtTs(g.s)}] ` : ''}${g.spk != null && mt.nspk > 1 ? spkName(mt, g.spk) + ': ' : ''}${g.text}`).join('\n\n');
+  // условные обозначения — как принято в стенограммах для суда; только если пометки есть
+  const legend = segs.some((g) => /\[|\(ЧЕЛОВЕК ПРОВЕРЬ\)/.test(g.text)) ? 'Автоматическая расшифровка аудиозаписи, время указано от начала записи.\nУсловные обозначения: [НЕРАЗБОРЧИВО] — речь есть, слов не разобрать; [ГОВОРЯТ ОДНОВРЕМЕННО] — наложение голосов; [МУЗЫКА], [ШУМ], [КРИК] и т. п. — посторонние звуки; [?слова?] — расслышано неуверенно; (ЧЕЛОВЕК ПРОВЕРЬ) — место нужно прослушать человеку.\n\n' : '';
+  return legend + body;
 }
 function renderMeeting(id) {
   const n = notes.find((x) => x.id === id);
   if (!n?.meeting) { app.innerHTML = '<div class="wrap empty">Расшифровки нет. <a href="#/">На главную</a></div>'; return; }
+  if (renderMeeting.id !== id) { renderMeeting.id = id; renderMeeting.q = ''; renderMeeting.only = false; }
   const mt = n.meeting, segs = mt.segs || mt.prevSegs || [], multi = (mt.nspk || 0) > 1;
+  const checks = segs.flatMap(segChecks).sort((a, b) => a - b), nChk = checks.length;
   const back = n.stream ? '#/s/' + encodeURIComponent(n.id) : '#/n/' + encodeURIComponent(n.id);
   app.innerHTML = `
   <header class="top"><div class="wrap row"><a class="iconbtn" href="${back}" aria-label="Назад">${I.back}</a>
@@ -1378,7 +1394,10 @@ function renderMeeting(id) {
     ${segs.length ? `
       ${multi ? `<div class="chips" style="flex-wrap:wrap;margin:6px 0">${Array.from({ length: mt.nspk }, (_, i) => `<button class="chip spk${i % 6}" data-ren="${i}">${esc(spkName(mt, i))} ✎</button>`).join('')}</div>
         <div class="small" style="margin-bottom:8px">Нажмите на имя, чтобы переименовать. Нажмите на время — запись включится с этого места.</div>` : '<div class="small" style="margin-bottom:8px">Нажмите на время — запись включится с этого места.</div>'}
-      <div id="msegs">${segs.map((g, i) => `<div class="mseg" data-i="${i}"><a class="ts" data-ts="${g.s}">${fmtTs(g.s)}</a>${multi && g.spk != null ? ` <b class="spk${g.spk % 6}">${esc(spkName(mt, g.spk))}</b>` : ''}<div class="mt">${esc(g.text)}</div></div>`).join('')}</div>
+      ${nChk ? `<div class="warnbox" style="margin:6px 0 10px">Трудных мест: <b>${nChk}</b> — помечены «ЧЕЛОВЕК ПРОВЕРЬ». Нажмите на пометку, чтобы послушать это место.
+        <div class="btns" style="margin-top:8px"><button class="btn" id="mnext">▶ Следующая пометка</button><button class="btn" id="monly">${renderMeeting.only ? 'Показать всё' : 'Только пометки'}</button></div></div>` : ''}
+      <input class="field" id="mfind" placeholder="Поиск по расшифровке" value="${esc(renderMeeting.q || '')}" style="margin-bottom:8px">
+      <div id="msegs">${segs.map((g, i) => `<div class="mseg" data-i="${i}"><a class="ts" data-ts="${g.s}">${fmtTs(g.s)}</a>${multi && g.spk != null ? ` <b class="spk${g.spk % 6}">${esc(spkName(mt, g.spk))}</b>` : ''}<div class="mt">${segHTML(g)}</div></div>`).join('')}</div>
       <div class="btns" style="margin-top:16px"><button class="btn" id="mcopy">📋 Скопировать</button><button class="btn" id="mnote">➜ Сохранить как заметку</button><button class="btn" id="mshare">⤴ Поделиться аудио</button><button class="btn" id="mredo">↻ Расшифровать заново</button><button class="btn danger" id="mdel">Удалить расшифровку</button></div>`
     : pcActive(mt) ? '' : '<div class="empty">Расшифровки пока нет.</div>'}
   </main>
@@ -1394,11 +1413,30 @@ function renderMeeting(id) {
   };
   au.onplay = () => load();
   load();
-  app.querySelectorAll('[data-ts]').forEach((a) => (a.onclick = async () => {
+  // включить запись с момента t (пометки — на 2 с раньше, чтобы услышать начало)
+  const playAt = async (t) => {
     if (!(await load())) return;
-    const t = +a.dataset.ts, go = () => { au.currentTime = Math.max(0, t - 0.3); au.play().catch(() => {}); };
+    const go = () => { au.currentTime = Math.max(0, t); au.play().catch(() => {}); };
     if (au.readyState >= 1) go(); else au.addEventListener('loadedmetadata', go, { once: true });
-  }));
+  };
+  app.querySelectorAll('[data-ts]').forEach((a) => (a.onclick = () => playAt(+a.dataset.ts - 0.3)));
+  app.querySelectorAll('[data-chk]').forEach((a) => (a.onclick = () => playAt(+a.dataset.chk - 2)));
+  const nx = $('#mnext'); if (nx) nx.onclick = () => {
+    const now = au.currentTime || 0, t = checks.find((c) => c - 2 > now + 0.5) ?? checks[0];
+    const el = [...app.querySelectorAll('[data-chk]')].find((a) => +a.dataset.chk === t);
+    el?.scrollIntoView({ block: 'center' });
+    playAt(t - 2);
+  };
+  const filterSegs = () => {
+    const q = (renderMeeting.q || '').trim().toLowerCase().replace(/ё/g, 'е');
+    app.querySelectorAll('.mseg').forEach((el) => {
+      const g = segs[+el.dataset.i], txt = (g.text + ' ' + spkName(mt, g.spk)).toLowerCase().replace(/ё/g, 'е').replace(/[(),]/g, '');
+      el.style.display = (renderMeeting.only && !segChecks(g).length) || (q && !txt.includes(q.replace(/[(),]/g, ''))) ? 'none' : '';
+    });
+  };
+  const mo = $('#monly'); if (mo) mo.onclick = () => { renderMeeting.only = !renderMeeting.only; mo.textContent = renderMeeting.only ? 'Показать всё' : 'Только пометки'; filterSegs(); };
+  $('#mfind').oninput = (e) => { renderMeeting.q = e.target.value; filterSegs(); };
+  filterSegs();
   let cur = -1;
   au.ontimeupdate = () => {
     const t = au.currentTime; let i = segs.findIndex((g) => t >= g.s - 0.3 && t < g.e + 0.5);

@@ -33,7 +33,7 @@ proxy_fix.fix(direct=_DIRECT)
 
 import requests  # noqa: E402  (после настройки прокси)
 
-AGENT_VERSION = '1.3'
+AGENT_VERSION = '1.4'
 API = os.environ.get('VN_YD_API', 'https://cloud-api.yandex.net/v1/disk')
 HOME = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'voice-notes-agent')
 TOKEN_FILE = os.path.join(HOME, 'token.txt')
@@ -54,6 +54,14 @@ MODELS_DIR = os.path.join(HOME, 'models')
 # Разметка говорящих (sherpa-onnx, без регистрации и без torch): сегментация pyannote 3.0 + «отпечатки голоса» 3D-Speaker
 SEG_URL = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2'
 EMB_URL = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx'
+# Что звучит в неразборчивом месте (музыка, крик, смех…) — классификатор звуков AudioSet, 28 МБ
+TAG_URL = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/audio-tagging-models/sherpa-onnx-ced-tiny-audio-tagging-2024-04-19.tar.bz2'
+# Пометка трудного места: её ищут поиском и по ней включают запись с этого момента
+CHECK = '(ЧЕЛОВЕК ПРОВЕРЬ)'
+LOW_PROB = 0.45      # слово с меньшей уверенностью Whisper — сомнительное
+LOW_RUN = 3          # столько сомнительных слов подряд — пометка [?…?]
+GAP_SEC = 2.0        # речь есть (по разметке говорящих), а слов нет — [НЕРАЗБОРЧИВО]
+OVERLAP_SEC = 1.0    # двое говорят одновременно дольше — [ГОВОРЯТ ОДНОВРЕМЕННО]
 PROMPT_RU = 'Это голосовая заметка. Я говорю короткими предложениями. Здесь стоят точки, запятые и вопросительные знаки. Всё понятно?'
 
 
@@ -197,6 +205,11 @@ def add_cuda_dlls():
                     pass
 
 
+def fmt_ts(x):
+    x = int(x)
+    return f'{x // 3600}:{x % 3600 // 60:02d}:{x % 60:02d}' if x >= 3600 else f'{x // 60}:{x % 60:02d}'
+
+
 def keep_awake(on):
     """Пока идёт распознавание, Windows не уходит в сон (экран при этом гаснет как обычно)."""
     if os.name != 'nt':
@@ -260,6 +273,117 @@ class Diarizer:
         return [(r.start, r.end, r.speaker) for r in res]
 
 
+class Tagger:
+    """Определяет, что звучит в отрезке: музыка, крик, смех, шум… Модель качается один раз."""
+    MAP = [  # (слова в названии класса AudioSet, пометка)
+        (('music', 'singing', 'song', 'musical', 'guitar', 'piano', 'drum', 'a capella'), 'МУЗЫКА'),
+        (('shout', 'yell', 'scream', 'bellow', 'whoop'), 'КРИК'),
+        (('laugh', 'giggle', 'chuckle', 'snicker'), 'СМЕХ'),
+        (('crying', 'sobbing', 'whimper', 'baby cry'), 'ПЛАЧ'),
+        (('telephone', 'ringtone', 'ring'), 'ЗВОНОК'),
+        (('dog', 'bark'), 'ЛАЙ СОБАКИ'),
+        (('vehicle', 'traffic', 'car', 'engine', 'motor', 'train', 'bus'), 'ШУМ ТРАНСПОРТА'),
+        (('applause', 'clapping'), 'АПЛОДИСМЕНТЫ'),
+        (('speech', 'conversation', 'babble', 'narration', 'chatter', 'whisper'), 'РЕЧЬ'),
+        (('silence',), 'ТИШИНА'),
+    ]
+
+    def __init__(self):
+        self.dir = os.path.join(MODELS_DIR, 'sherpa-onnx-ced-tiny-audio-tagging-2024-04-19')
+        self.at = None
+
+    def load(self):
+        if self.at:
+            return
+        import sherpa_onnx
+        if not os.path.exists(os.path.join(self.dir, 'model.int8.onnx')):
+            log.info('Скачиваю модель распознавания звуков (28 МБ)…')
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            arc = os.path.join(MODELS_DIR, 'tag.tar.bz2')
+            fetch_file(TAG_URL, arc)
+            import tarfile
+            with tarfile.open(arc) as t:
+                t.extractall(MODELS_DIR)
+            os.remove(arc)
+        self.at = sherpa_onnx.AudioTagging(sherpa_onnx.AudioTaggingConfig(
+            model=sherpa_onnx.AudioTaggingModelConfig(ced=os.path.join(self.dir, 'model.int8.onnx'), num_threads=2),
+            labels=os.path.join(self.dir, 'class_labels_indices.csv'), top_k=5))
+
+    def label(self, audio, a, b):
+        """Русская пометка для отрезка a..b (секунды) или None, если не понять."""
+        self.load()
+        x = audio[int(a * 16000):int(min(b, a + 10) * 16000)]
+        if len(x) < 8000:
+            return None
+        st = self.at.create_stream()
+        st.accept_waveform(16000, x)
+        for e in self.at.compute(st):
+            name = e.name.lower()
+            for keys, ru in self.MAP:
+                if any(k in name for k in keys):
+                    return ru
+        return 'ШУМ'
+
+
+def find_events(words, turns, drops, dur):
+    """Трудные места: [(start, end, kind)], kind = gap | overlap | drop.
+    gap — разметка говорящих слышит речь, а Whisper не дал ни слова;
+    overlap — два голоса одновременно; drop — отброшенная «галлюцинация» Whisper (обычно шум/музыка)."""
+    ev = []
+    covered = sorted((w[0] - 0.5, w[1] + 0.5) for w in words)
+    for a, b, _ in turns:
+        t = a
+        for ca, cb in covered:
+            if cb <= t or ca >= b:
+                continue
+            if ca - t >= GAP_SEC:
+                ev.append((t, ca, 'gap'))
+            t = max(t, cb)
+        if b - t >= GAP_SEC:
+            ev.append((t, b, 'gap'))
+    for i in range(len(turns)):
+        for j in range(i + 1, len(turns)):
+            a1, b1, s1 = turns[i]
+            a2, b2, s2 = turns[j]
+            if a2 >= b1:
+                break
+            if s1 != s2 and min(b1, b2) - max(a1, a2) >= OVERLAP_SEC:
+                ev.append((max(a1, a2), min(b1, b2), 'overlap'))
+    ev += [(a, b, 'drop') for a, b in drops]
+    # перекрывающиеся пометки — одной; вид — самый говорящий (наложение голосов > отброшенный текст > пропуск)
+    rank = {'overlap': 2, 'drop': 1, 'gap': 0}
+    ev.sort()
+    out = []
+    for e in ev:
+        if out and e[0] <= out[-1][1] + 0.5:
+            k = max(out[-1][2], e[2], key=rank.get)
+            out[-1] = (out[-1][0], max(out[-1][1], e[1]), k)
+        else:
+            out.append(e)
+    return out
+
+
+def mark_low_confidence(words):
+    """Подряд ≥ LOW_RUN сомнительных слов → «[?слова?] (ЧЕЛОВЕК ПРОВЕРЬ)», как в судебных стенограммах."""
+    out, i = [], 0
+    while i < len(words):
+        j = i
+        while j < len(words) and words[j][3] < LOW_PROB:
+            j += 1
+        if j - i >= LOW_RUN:
+            run = words[i:j]
+            first, last = run[0], run[-1]
+            out.append((first[0], first[1], re.sub(r'^(\s*)', r'\1[?', first[2], count=1), None))
+            out += [(w[0], w[1], w[2], None) for w in run[1:-1]]
+            out.append((last[0], last[1], last[2] + '?] ' + CHECK, first[0]))
+            i = j
+        else:
+            w = words[i]
+            out.append((w[0], w[1], w[2], None))
+            i += 1
+    return out
+
+
 def assign_speakers(words, turns):
     """Каждому слову — говорящего, чей отрезок накрывает середину слова (или ближайшего).
     Номера говорящих перенумеровываются по порядку появления: 0, 1, 2…"""
@@ -287,14 +411,16 @@ def build_utterances(words, spk, max_sec=45):
     """Слова → реплики: новая реплика при смене говорящего, паузе > 2 с
     или когда реплика длиннее max_sec и закончилось предложение."""
     utts = []
-    for (a, b, t), sp in zip(words, spk):
+    for (a, b, t, chk), sp in zip(words, spk):
         u = utts[-1] if utts else None
         if (u is None or sp != u['spk'] or a - u['e'] > 2
-                or (b - u['s'] > max_sec and re.search(r'[.!?…]$', u['text']))):
+                or (b - u['s'] > max_sec and re.search(r'[.!?…)]$', u['text']))):
             u = {'s': round(a, 2), 'e': round(b, 2), 'spk': sp, 'text': ''}
             utts.append(u)
         u['text'] += t
-        u['e'] = round(b, 2)
+        u['e'] = round(max(u['e'], b), 2)
+        if chk is not None:  # время каждой пометки «ЧЕЛОВЕК ПРОВЕРЬ» по порядку — телефон включает с него запись
+            u.setdefault('chk', []).append(round(chk, 2))
     for u in utts:
         u['text'] = u['text'].strip()
         u['text'] = u['text'][:1].upper() + u['text'][1:]
@@ -370,7 +496,7 @@ class Engine:
         audio = decode_audio(path, sampling_rate=16000)
         dur = len(audio) / 16000
         try:
-            words = self._words(audio, lang, dur, progress)
+            words, drops = self._words(audio, lang, dur, progress)
         except Exception as e:
             if self.device != 'cuda':
                 raise
@@ -378,20 +504,46 @@ class Engine:
             self.cuda_failed = True
             self.model = None
             self.load()
-            words = self._words(audio, lang, dur, progress)
+            words, drops = self._words(audio, lang, dur, progress)
         self.last_used = time.time()
         turns, derr = [], None
-        if speakers != 1 and words:
+        # разметка нужна и одному говорящему: по ней видно, где речь была, а слов нет
+        if words or drops:
             progress(0.97, 'speakers')
             try:
                 td = time.time()
-                turns = Diarizer().run(audio, speakers)
+                turns = Diarizer().run(audio, speakers if speakers > 0 else 0)
                 log.info('Разметка говорящих: %d отрезков, %d чел., %.0f с', len(turns), len({t[2] for t in turns}), time.time() - td)
             except Exception as e:
                 derr = str(e)[:200]
                 log.info('Разметка говорящих не удалась: %s\n%s', e, traceback.format_exc())
-        spk = assign_speakers(words, turns)
-        utts = build_utterances(words, spk)
+        tokens = mark_low_confidence(words)
+        # трудные места (шум, наложение голосов, неразборчиво) — пометками в тексте, в своё время
+        tagger = Tagger()
+        nev = 0
+        for a, b, kind in find_events(words, turns, drops, dur):
+            label = None
+            try:
+                label = tagger.label(audio, a, b)
+            except Exception as e:
+                if not nev:
+                    log.info('Классификатор звуков не сработал: %s', e)
+            if label == 'ТИШИНА':
+                continue
+            if kind == 'overlap':
+                txt = 'ГОВОРЯТ ОДНОВРЕМЕННО'
+            elif label in (None, 'РЕЧЬ'):
+                txt = 'НЕРАЗБОРЧИВО'
+            else:
+                txt = label + ', НЕ РАЗОБРАТЬ СЛОВ' if kind == 'gap' else label
+            tokens.append((a, b, f' [{txt}, {fmt_ts(a)}–{fmt_ts(b)}] {CHECK}', a))
+            nev += 1
+        tokens.sort(key=lambda w: w[0])
+        log.info('Трудных мест: %d', sum(1 for w in tokens if w[3] is not None))
+        if speakers == 1:
+            turns = []
+        spk = assign_speakers(tokens, turns)
+        utts = build_utterances(tokens, spk)
         n = len({u['spk'] for u in utts if u['spk'] is not None})
         return utts, n, derr, dur, time.time() - t0
 
@@ -404,22 +556,24 @@ class Engine:
             # на длинной записи эти настройки не дают Whisper «зациклиться» на тишине
             condition_on_previous_text=True, compression_ratio_threshold=2.2, no_speech_threshold=0.6,
             hallucination_silence_threshold=2)
-        words, last, prev = [], 0, None
+        words, drops, last, prev = [], [], 0, None
         for s in segs:
             t = s.text.strip()
             if not t or re.fullmatch(r'[\s.,!?…\-–—]*', t):
                 continue
             if len(t) < 90 and any(re.search(h, t, re.I) for h in HALL):
+                drops.append((s.start, s.end))  # «Субтитры…» на шуме или музыке — место стоит проверить
                 continue
             if t == prev:  # повтор — типичная «петля» Whisper
+                drops.append((s.start, s.end))
                 continue
             prev = t
             for w in s.words or []:
-                words.append((w.start, w.end, w.word))
+                words.append((w.start, w.end, w.word, w.probability if w.probability is not None else 1.0))
             if time.time() - last > 30:
                 progress(min(0.95, s.end / max(dur, 1)), 'text')
                 last = time.time()
-        return words
+        return words, drops
 
     def _run(self, path, lang):
         ru = lang in ('ru', None, '', 'auto')
