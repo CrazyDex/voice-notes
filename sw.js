@@ -1,6 +1,6 @@
 // Офлайн-кэш + заголовки COOP/COEP (включают многопоточность WebAssembly — распознавание на CPU в 2–3 раза быстрее).
 // Модели кэширует сама transformers.js.
-const SHELL = 'vn-shell-v113', CDN = 'vn-cdn-v1';
+const SHELL = 'vn-shell-v114', CDN = 'vn-cdn-v1';
 const FILES = ['./', 'index.html', 'app.js', 'audio.js', 'pc.js', 'asr-worker.js', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'vendor/ogg-opus-decoder.min.js'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(SHELL).then((c) => c.addAll(FILES)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', (e) => {

@@ -61,6 +61,7 @@ h1{font-size:26px;margin:4px 0 8px;letter-spacing:-.02em}
 .chip.spk0,.chip.spk1,.chip.spk2,.chip.spk3,.chip.spk4,.chip.spk5{font-weight:600}
 .mplayer{position:fixed;left:0;right:0;bottom:0;padding:10px 16px calc(var(--sab) + 10px);background:var(--bg);border-top:1px solid var(--surface2);z-index:10}
 .mplayer audio{width:100%}
+.fab2{position:fixed;left:calc(50% + 62px);bottom:calc(var(--sab) + 32px);width:56px;height:56px;border-radius:50%;background:var(--surface2);color:var(--text);display:grid;place-items:center;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.15)}.fab2 svg{width:24px;height:24px}
 .badge{padding:2px 8px;border-radius:999px;background:var(--surface2);color:var(--text)}
 .tg{color:var(--tag)}
 .empty{text-align:center;color:var(--muted);padding:60px 20px}
@@ -121,7 +122,7 @@ audio{width:100%;margin-top:6px}
 </head>
 <body>
 <div id="app"></div>
-<script type="module" src="app.js?v=1.13"></script>
+<script type="module" src="app.js?v=1.14"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

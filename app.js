@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.13';
+const VERSION = '1.14';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -264,6 +264,7 @@ const I = {
   back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>',
   file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 18v-6M9 15l3 3 3-3"/></svg>',
   wave: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 7c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 6 0M2 12c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 6 0M2 17c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 6 0"/></svg>',
+  pen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
 };
 
@@ -1558,7 +1559,22 @@ function render() {
   else if (r.name === 'projects') renderProjects();
   else renderHome();
 }
-addEventListener('hashchange', () => { render(); scrollTo(0, 0); });
+// Текстовая заметка без записи: сразу открывается в «Правке»; если ничего не ввели — при уходе удаляется
+function newTextNote() {
+  const n = { id: uid(), createdAt: Date.now(), updatedAt: Date.now(), title: '', text: '', segTexts: null, prefix: '', status: 'done', draft: true,
+    tags: filter.tag ? [filter.tag] : [], projectId: filter.project && filter.project !== 'none' ? filter.project : null };
+  notes.unshift(n); saveNote(n); trace('текстовая заметка ' + n.id);
+  location.hash = '#/n/' + encodeURIComponent(n.id);
+  setTimeout(() => $('#ntext')?.focus(), 50);
+}
+function dropEmptyDrafts() {
+  const r = route();
+  for (const n of notes.filter((x) => x.draft && !(r.name === 'note' && r.id === x.id))) {
+    if ((n.text || '').trim() || (n.title || '').trim() || n.hasAudio || (n.clips || []).length || n.status === 'recording') { delete n.draft; saveNote(n); continue; }
+    notes = notes.filter((x) => x !== n); DB.del('notes', n.id);
+  }
+}
+addEventListener('hashchange', () => { dropEmptyDrafts(); render(); scrollTo(0, 0); });
 
 /* ================= Главный экран ================= */
 function renderHome() {
@@ -1574,9 +1590,11 @@ function renderHome() {
     <div class="status" data-asr>${asrStatusHTML()}</div>
   </div></header>
   <main class="wrap">${crashNote ? `<div class="warnbox" id="crash">${esc(crashNote)} <a href="#/settings">Настройки</a> · <a id="crashok">Понятно</a></div>` : ''}<div class="list" id="list"></div></main>
-  <button class="fab" id="fab" aria-label="Записать">${I.mic}</button>`;
+  <button class="fab" id="fab" aria-label="Записать">${I.mic}</button>
+  <button class="fab2" id="fabtext" aria-label="Текстовая заметка" title="Новая заметка без записи">${I.pen}</button>`;
   $('#q').oninput = (e) => { filter.q = e.target.value; renderList(); };
   $('#fab').onclick = () => startRecording();
+  $('#fabtext').onclick = newTextNote;
   $('#impbtn').onclick = pickAudioFiles;
   const ok = $('#crashok'); if (ok) ok.onclick = () => { crashNote = ''; $('#crash').remove(); };
   renderChips(); renderList();
