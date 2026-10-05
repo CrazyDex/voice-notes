@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.12';
+const VERSION = '1.13';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -1229,6 +1229,35 @@ function fragPCHTML(f) {
   return '';
 }
 
+/* ================= Поделиться аудио ================= */
+// iPhone: системное меню «Поделиться» (Telegram, Файлы, AirDrop…); где его нет — скачивание файла.
+// Safari разрешает share только сразу после нажатия: если файл готовился слишком долго,
+// показываем окно с кнопкой — второе нажатие уже открывает меню мгновенно.
+const fileSafe = (t) => (t || 'запись').replace(/[\\/:*?"<>|#\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60) || 'запись';
+function audioName(n, suffix = '') {
+  const d = new Date(n.createdAt || Date.now()), p2 = (x) => String(x).padStart(2, '0');
+  return `${fileSafe(titleOf(n))}${suffix ? ' ' + suffix : ''} ${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}.wav`;
+}
+async function shareAudio(getBlob, name) {
+  let blob;
+  try { blob = await getBlob(); } catch (e) { toast('Не удалось собрать аудио: ' + (e.message || e), 4000); return; }
+  if (!blob) { toast('Аудио не найдено'); return; }
+  const file = new File([blob], name, { type: blob.type || 'audio/wav' });
+  const go = async () => {
+    if (navigator.canShare?.({ files: [file] })) {
+      try { await navigator.share({ files: [file], title: name }); trace('поделиться: ' + name); }
+      catch (e) { if (e.name === 'NotAllowedError') return false; if (e.name !== 'AbortError') toast('Не удалось поделиться: ' + (e.message || e)); }
+      return true;
+    }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    return true;
+  };
+  if (await go()) return;
+  sheet(`<div class="sec" style="margin-top:0">Аудио готово</div><div class="small" style="margin-bottom:10px">${esc(name)} · ${(blob.size / 1e6).toFixed(1)} МБ</div>
+    <button class="btn primary" id="shgo" style="width:100%">⤴ Поделиться</button>`, (el, close) => { $('#shgo', el).onclick = async () => { await go(); close(); }; });
+}
+
 /* ================= Расшифровка встречи ================= */
 // Вся запись (заметка с дозаписями или поток) одним файлом уходит на ПК; компьютер возвращает
 // реплики со временем и говорящим. n.meeting = { id: 'meet', pc, speakers, parts: [{key, start, dur}],
@@ -1349,7 +1378,7 @@ function renderMeeting(id) {
       ${multi ? `<div class="chips" style="flex-wrap:wrap;margin:6px 0">${Array.from({ length: mt.nspk }, (_, i) => `<button class="chip spk${i % 6}" data-ren="${i}">${esc(spkName(mt, i))} ✎</button>`).join('')}</div>
         <div class="small" style="margin-bottom:8px">Нажмите на имя, чтобы переименовать. Нажмите на время — запись включится с этого места.</div>` : '<div class="small" style="margin-bottom:8px">Нажмите на время — запись включится с этого места.</div>'}
       <div id="msegs">${segs.map((g, i) => `<div class="mseg" data-i="${i}"><a class="ts" data-ts="${g.s}">${fmtTs(g.s)}</a>${multi && g.spk != null ? ` <b class="spk${g.spk % 6}">${esc(spkName(mt, g.spk))}</b>` : ''}<div class="mt">${esc(g.text)}</div></div>`).join('')}</div>
-      <div class="btns" style="margin-top:16px"><button class="btn" id="mcopy">📋 Скопировать</button><button class="btn" id="mnote">➜ Сохранить как заметку</button><button class="btn" id="mredo">↻ Расшифровать заново</button><button class="btn danger" id="mdel">Удалить расшифровку</button></div>`
+      <div class="btns" style="margin-top:16px"><button class="btn" id="mcopy">📋 Скопировать</button><button class="btn" id="mnote">➜ Сохранить как заметку</button><button class="btn" id="mshare">⤴ Поделиться аудио</button><button class="btn" id="mredo">↻ Расшифровать заново</button><button class="btn danger" id="mdel">Удалить расшифровку</button></div>`
     : pcActive(mt) ? '' : '<div class="empty">Расшифровки пока нет.</div>'}
   </main>
   ${segs.length ? '<div class="mplayer"><audio id="maudio" controls preload="none"></audio></div>' : ''}`;
@@ -1386,6 +1415,7 @@ function renderMeeting(id) {
     m.text = meetingText(n) + `\n\nРасшифровка записи [[${titleOf(n)}]]`;
     notes.unshift(m); saveNote(m); toast('Заметка создана'); location.hash = '#/n/' + encodeURIComponent(m.id);
   };
+  $('#mshare').onclick = () => shareAudio(() => meetingBlob(n), audioName(n));
   $('#mredo').onclick = () => askSpeakers((k) => { sendMeeting(n, k); renderMeeting(id); });
   $('#mdel').onclick = async () => { if (!confirm('Удалить расшифровку встречи? Аудио и заметка останутся.')) return; delete n.meeting; saveNote(n); location.hash = back; };
 }
@@ -1420,7 +1450,7 @@ function renderStream(id, scrollNew) {
   <main class="wrap" style="padding-bottom:130px">
     <input class="title-in" id="stitle" value="${esc(s.title)}">
     ${nNew > 1 || (pcOn() && nCan) ? `<div class="btns" style="margin:4px 0 10px">${nNew > 1 ? `<button class="btn" id="keepall">✓ Оставить все новые (${nNew})</button>` : ''}${pcOn() && nCan ? `<button class="btn" id="spcall">🖥 Распознать все на ПК (${nCan})</button>` : ''}</div>` : ''}
-    ${fs.some((f) => f.hasAudio) || s.meeting ? `<div class="btns" style="margin:0 0 10px"><button class="btn" id="smeet">${meetingBtnLabel(s)}</button></div>` : ''}
+    ${fs.some((f) => f.hasAudio) || s.meeting ? `<div class="btns" style="margin:0 0 10px"><button class="btn" id="smeet">${meetingBtnLabel(s)}</button>${fs.some((f) => f.hasAudio) ? '<button class="btn" id="sshare">⤴ Аудио потока</button>' : ''}</div>` : ''}
     ${pcOn() && fs.length && !nCan && fs.some(pcDone) ? `<div class="small" style="margin:0 0 10px">🖥 ✓ — распознано на компьютере.</div>` : ''}
     ${fs.length ? '' : '<div class="empty">Пока пусто. Нажмите красную кнопку и говорите подряд; между мыслями нажимайте «Следующая мысль».</div>'}
     ${fs.map((f, i) => `<div class="card frag${f.isNew ? ' new' : ''}" data-frag="${f.id}">
@@ -1453,6 +1483,7 @@ function renderStream(id, scrollNew) {
   };
   const fab = $('#sfab'); if (fab) fab.onclick = () => startStream(s);
   const sm = $('#smeet'); if (sm) sm.onclick = () => openMeeting(s);
+  const ssh = $('#sshare'); if (ssh) ssh.onclick = () => shareAudio(() => meetingBlob(s, meetingKeys(s)), audioName(s));
   const pa = $('#spcall'); if (pa) pa.onclick = () => {
     const list = fs.filter(pcCan); if (!list.length) return;
     for (const f of list) f.pc = { state: 'outbox', sentAt: Date.now() };
@@ -1480,7 +1511,8 @@ function renderStream(id, scrollNew) {
     const f = get(b.dataset.fplay), blob = await DB.get('audio', clipKey(s, f));
     const box = $(`[data-faudio="${f.id}"]`); if (!box) return;
     if (!blob) { box.innerHTML = '<div class="small">Аудио не найдено</div>'; return; }
-    box.innerHTML = `<audio controls autoplay style="margin-top:8px;width:100%" src="${URL.createObjectURL(blob)}"></audio>`;
+    box.innerHTML = `<audio controls autoplay style="margin-top:8px;width:100%" src="${URL.createObjectURL(blob)}"></audio><div class="small"><a data-fshare="${f.id}">⤴ Поделиться</a></div>`;
+    $('[data-fshare]', box).onclick = () => shareAudio(async () => blob, audioName(s, 'мысль ' + (fs.indexOf(f) + 1)));
   }));
   app.querySelectorAll('[data-ftopc]').forEach((b) => (b.onclick = () => {
     const f = get(b.dataset.ftopc); f.pc = { state: 'outbox', sentAt: Date.now() }; saveNote(s); redraw();
@@ -1665,6 +1697,7 @@ function renderNote(id) {
     <div class="btns" style="margin-top:10px">
       ${pcCan(n) ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
       ${n.hasAudio && pcDone(n) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере${n.pc.model ? ' (' + esc(n.pc.model) + ')' : ''} · <a id="topcagain">ещё раз</a></span>` : ''}
+      ${meetingKeys(n).length > 1 ? `<button class="btn" id="nshareall">⤴ Всё аудио одним файлом</button>` : ''}
       ${n.hasAudio || clips.some((c) => c.hasAudio) || n.meeting ? `<button class="btn" id="nmeet">${meetingBtnLabel(n)}</button>` : ''}
       ${pcOn() && [n, ...clips].filter(pcCan).length > 1 ? `<button class="btn" id="topcall">🖥 Распознать все записи (${[n, ...clips].filter(pcCan).length})</button>` : ''}
       ${n.hasAudio && !IS_IOS && !clips.length ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
@@ -1727,6 +1760,7 @@ function renderNote(id) {
   const tp = $('#topc'); if (tp) tp.onclick = () => sendToPC(n);
   const tpa = $('#topcagain'); if (tpa) tpa.onclick = () => { if (confirm('Распознать на компьютере ещё раз? Если текст не правили, он заменится, прежний останется в «Прежних вариантах».')) { n.pc = null; sendToPC(n); } };
   const nm = $('#nmeet'); if (nm) nm.onclick = () => openMeeting(n);
+  const nsa = $('#nshareall'); if (nsa) nsa.onclick = () => shareAudio(() => meetingBlob(n, meetingKeys(n)), audioName(n));
   const tpall = $('#topcall'); if (tpall) tpall.onclick = async () => {
     const list = [n, ...clips].filter(pcCan);
     for (const o of list) await sendToPC(n, true, o === n ? undefined : o);
@@ -1750,7 +1784,8 @@ function renderNote(id) {
     if (c.hasAudio) DB.get('audio', clipKey(n, c)).then((blob) => {
       const box = $(`[data-caudio="${c.id}"]`); if (!box) return;
       if (!blob) { box.textContent = 'Не найдено'; return; }
-      box.innerHTML = `<audio controls preload="metadata" src="${URL.createObjectURL(blob)}"></audio><div>${(blob.size / 1e6).toFixed(1)} МБ</div>`;
+      box.innerHTML = `<audio controls preload="metadata" src="${URL.createObjectURL(blob)}"></audio><div class="row" style="gap:10px"><span>${(blob.size / 1e6).toFixed(1)} МБ</span><a data-cshare="${c.id}">⤴ Поделиться</a></div>`;
+      $('[data-cshare]', box).onclick = () => shareAudio(async () => blob, audioName(n, clipTime(c)));
     });
   }
   app.querySelectorAll('[data-ctopc]').forEach((b) => (b.onclick = () => sendToPC(n, false, clips.find((c) => c.id === b.dataset.ctopc))));
@@ -1768,7 +1803,8 @@ function renderNote(id) {
   if (n.hasAudio) DB.get('audio', n.id).then((blob) => {
     const box = $('#naudio'); if (!box) return;
     if (!blob) { box.textContent = 'Не найдено'; return; }
-    box.innerHTML = `<audio controls preload="metadata" src="${URL.createObjectURL(blob)}"></audio><div>${(blob.size / 1e6).toFixed(1)} МБ</div>`;
+    box.innerHTML = `<audio controls preload="metadata" src="${URL.createObjectURL(blob)}"></audio><div class="row" style="gap:10px"><span>${(blob.size / 1e6).toFixed(1)} МБ</span><a data-share="main">⤴ Поделиться</a></div>`;
+    $('[data-share="main"]', box).onclick = () => shareAudio(async () => blob, audioName(n));
   });
 }
 function bindSug(n, redraw = true) {
