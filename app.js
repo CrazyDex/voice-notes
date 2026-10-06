@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.15';
+const VERSION = '1.16';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -794,6 +794,7 @@ function pcOnlineText() {
   // телефон давно не заглядывал на Диск — сведения о компьютере могут быть устаревшими
   const stale = checked && Date.now() - checked > 10 * 60 * 1000 ? ` Телефон проверял ${ago(checked)}.` : '';
   if (!p?.seen) return { on: false, text: 'Программа на компьютере ещё ни разу не выходила на связь.' };
+  if (p.stoppedAt) return { on: false, text: `Программа на компьютере закрыта (${ago(p.stoppedAt)}). Запустите ярлык «Голосовые заметки (ПК)».${stale}` };
   if (Date.now() - p.seen < PC_ONLINE_MS) return { on: true, text: `Компьютер в сети${p.model ? ' · ' + p.model : ''}${p.device ? ' (' + (p.device === 'cuda' ? 'видеокарта' : 'процессор') + ')' : ''}.` };
   return { on: false, text: `Компьютер не отвечает: был в сети ${ago(p.seen)} (выключен или спит).${stale}` };
 }
@@ -893,7 +894,7 @@ async function pcSync() {
     try {
       const m = await d.meta('app:/pc.json');
       const p = m.custom_properties || {};
-      if (p.seen) ls.set('vn.pcSeen', { seen: +p.seen, model: p.model, device: p.device, busy: p.busy, sleptFrom: +p.sleptFrom || 0, sleptTo: +p.sleptTo || 0 });
+      if (p.seen) ls.set('vn.pcSeen', { seen: +p.seen, model: p.model, device: p.device, busy: p.busy, sleptFrom: +p.sleptFrom || 0, sleptTo: +p.sleptTo || 0, stoppedAt: +p.stoppedAt || 0 });
       ls.set('vn.pcChecked', Date.now());
     } catch (e) { if (e.status !== 404) throw e; }
     if (!PC.dirsOk) { await d.mkdir('app:/jobs'); await d.mkdir('app:/results'); PC.dirsOk = true; }

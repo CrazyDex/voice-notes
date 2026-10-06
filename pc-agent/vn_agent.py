@@ -8,6 +8,9 @@ faster-whisper'ом на видеокарте (или процессоре) и �
 Запуск:  python vn_agent.py           — работать (так её запускает Windows при входе)
          python vn_agent.py --setup   — ввести ключ, проверить связь, скачать модель
          python vn_agent.py --once    — обработать очередь один раз и выйти
+         python vn_agent.py --install-extras / --remove-extras — значок, ярлыки на рабочем столе и в «Пуске»
+
+Пока работает, в трее (у часов) значок с меню: состояние, журнал, папка, перезапуск, выход.
 """
 import json
 import logging
@@ -33,7 +36,7 @@ proxy_fix.fix(direct=_DIRECT)
 
 import requests  # noqa: E402  (после настройки прокси)
 
-AGENT_VERSION = '1.4'
+AGENT_VERSION = '1.5'
 API = os.environ.get('VN_YD_API', 'https://cloud-api.yandex.net/v1/disk')
 HOME = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'voice-notes-agent')
 TOKEN_FILE = os.path.join(HOME, 'token.txt')
@@ -609,6 +612,10 @@ class Agent:
         self.last_beat = 0
         self.slept = None
         self.ready = False
+        self.status = 'запускается…'
+        self.stopping = False
+        import threading
+        self.wake = threading.Event()
 
     def setup_dirs(self):
         for p in ('app:/jobs', 'app:/results'):
@@ -622,6 +629,7 @@ class Agent:
             'seen': int(time.time() * 1000), 'busy': 1 if busy else 0, 'agent': AGENT_VERSION,
             'model': self.eng.name or self.cfg['model'],
             'device': self.eng.device or ('cpu' if self.cfg['device'] == 'cpu' or self.eng.cuda_failed else 'cuda'),
+            'stoppedAt': 0,
         }
         if self.slept:
             p['sleptFrom'], p['sleptTo'] = self.slept
@@ -657,6 +665,7 @@ class Agent:
             log.info('Задание %s (%.1f МБ)', nid, (j.get('size') or 0) / 1e6)
             self.d.props(path, {'status': 'working', 'startedAt': int(time.time() * 1000)})
             self.busy = True
+            self.status = 'распознаёт запись…'
             if self.cfg.get('keep_awake', True):
                 keep_awake(True)
             self.beat(busy=True, force=True)
@@ -714,8 +723,10 @@ class Agent:
 
         def loop():
             last = time.time()
-            while True:
+            while not self.stopping:
                 time.sleep(self.cfg['heartbeat_sec'])
+                if self.stopping:
+                    return
                 now = time.time()
                 # во сне поток стоит: после пробуждения «прошла минута» оказывается часами
                 self.note_gap(last * 1000, now * 1000)
@@ -731,16 +742,19 @@ class Agent:
                  os.environ.get('HTTPS_PROXY') or ('нет' if not os.environ.get('NO_PROXY') else 'напрямую'))
         self.heartbeat_loop()
         delay = self.cfg['poll_sec']
-        while True:
+        while not self.stopping:
             try:
                 self.tick()
+                self.status = 'в сети, ждёт заданий'
                 delay = self.cfg['poll_sec']
             except ApiError as e:
                 if e.status == 401:
                     log.info('Ключ Яндекс Диска недействителен — запустите install.bat заново и вставьте новый ключ')
+                    self.status = 'ключ Яндекс Диска недействителен'
                     delay = 600
                 else:
                     log.info('Яндекс Диск: %s', e)
+                    self.status = 'Яндекс Диск не отвечает'
                     delay = min(300, delay * 2)
             except requests.exceptions.ProxyError as e:
                 log.info('Прокси не отвечает (%s) — дальше хожу напрямую', e.__class__.__name__)
@@ -748,11 +762,147 @@ class Agent:
                 delay = 10
             except requests.RequestException as e:
                 log.info('Нет связи: %s', e.__class__.__name__)  # компьютер только проснулся / нет интернета
+                self.status = 'нет интернета'
                 delay = min(300, delay * 2)
             except Exception as e:
                 log.info('Ошибка: %s\n%s', e, traceback.format_exc())
+                self.status = 'ошибка, см. журнал'
                 delay = 60
-            time.sleep(delay)
+            self.wake.wait(delay)
+            self.wake.clear()
+
+    def stop(self):
+        """Выход из трея: телефон должен написать «программа закрыта», а не «компьютер спит»."""
+        self.stopping = True
+        log.info('Программа закрыта из трея')
+        try:
+            now = int(time.time() * 1000)
+            self.d.props('app:/pc.json', {**self.beat_props(False), 'seen': now, 'stoppedAt': now})
+        except Exception:
+            pass
+
+# ---------------- Значок в трее, ярлыки ----------------
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_FILE = os.path.join(INSTALL_DIR, 'icon.ico')
+SHORTCUT = 'Голосовые заметки (ПК)'
+
+
+def make_image(busy=False, size=64):
+    """Красный круг с белым микрофоном (оранжевый — когда распознаёт)."""
+    from PIL import Image, ImageDraw
+    im = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    k = size / 64
+    d.ellipse((2 * k, 2 * k, 62 * k, 62 * k), fill=(240, 140, 30) if busy else (229, 72, 77))
+    d.rounded_rectangle((25 * k, 12 * k, 39 * k, 38 * k), radius=7 * k, fill='white')
+    d.arc((18 * k, 22 * k, 46 * k, 46 * k), 0, 180, fill='white', width=max(1, int(3 * k)))
+    d.line((32 * k, 46 * k, 32 * k, 52 * k), fill='white', width=max(1, int(3 * k)))
+    d.line((24 * k, 52 * k, 40 * k, 52 * k), fill='white', width=max(1, int(3 * k)))
+    return im
+
+
+def single_instance():
+    """Вторая копия не запускается (ярлык при работающей программе): только подсказка, где значок."""
+    if os.name != 'nt':
+        return True
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    globals()['_MUTEX'] = k32.CreateMutexW(None, False, 'VoiceNotesAgentMutex')
+    if k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        ctypes.windll.user32.MessageBoxW(None, 'Программа распознавания уже работает.\n\nЕё значок — в трее справа внизу, у часов '
+                                         '(может прятаться под стрелкой ˄). Правый щелчок по значку — меню и «Выход».',
+                                         'Голосовые заметки', 0x40)
+        return False
+    return True
+
+
+def run_tray(agent):
+    """Основной цикл — в отдельном потоке, значок — в главном (так требует Windows)."""
+    import threading
+    try:
+        import pystray
+    except Exception as e:
+        log.info('Значок в трее недоступен (%s) — работаю без него', e)
+        agent.run()
+        return
+    threading.Thread(target=agent.run, daemon=True).start()
+    imgs = {False: make_image(False), True: make_image(True)}
+
+    def title():
+        return f'Голосовые заметки v{AGENT_VERSION}: {agent.status}'
+
+    def do_exit(icon, _):
+        agent.stop()
+        icon.stop()
+
+    def do_restart(icon, _):
+        agent.stop()
+        icon.stop()
+        globals()['_RESTART'] = True
+
+    def check_now(icon, _):
+        agent.wake.set()
+
+    icon = pystray.Icon('voice-notes-agent', imgs[False], title(), menu=pystray.Menu(
+        pystray.MenuItem(lambda _: title(), None, enabled=False),
+        pystray.MenuItem('Проверить задания сейчас', check_now, default=True),
+        pystray.MenuItem('Открыть журнал', lambda *_: os.startfile(LOG_FILE)),
+        pystray.MenuItem('Открыть папку с журналом и настройками', lambda *_: os.startfile(HOME)),
+        pystray.MenuItem('Открыть папку программы', lambda *_: os.startfile(INSTALL_DIR)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Перезапустить', do_restart),
+        pystray.MenuItem('Выход', do_exit),
+    ))
+
+    def refresh(ic):
+        ic.visible = True
+        while not agent.stopping:
+            try:
+                ic.icon = imgs[agent.busy]
+                ic.title = title()[:127]
+                ic.update_menu()
+            except Exception:
+                pass
+            time.sleep(3)
+    icon.run(setup=refresh)
+
+
+def _ps(script):
+    """PowerShell-скрипт с русскими путями: через -EncodedCommand, чтобы кодировка не ломалась."""
+    import base64
+    import subprocess
+    enc = base64.b64encode(script.encode('utf-16-le')).decode()
+    return subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', enc],
+                          capture_output=True, text=True)
+
+
+def install_extras():
+    """Значок icon.ico и ярлыки «Голосовые заметки (ПК)» на рабочем столе и в меню «Пуск»."""
+    make_image(False, 256).save(ICON_FILE, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
+    pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+    script = os.path.abspath(__file__)
+    ps = f"""
+$w = New-Object -ComObject WScript.Shell
+foreach ($dir in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {{
+  $l = $w.CreateShortcut((Join-Path $dir '{SHORTCUT}.lnk'))
+  $l.TargetPath = '{pyw}'
+  $l.Arguments = '"{script}"'
+  $l.WorkingDirectory = '{INSTALL_DIR}'
+  $l.IconLocation = '{ICON_FILE}'
+  $l.Description = 'Распознавание голосовых заметок на компьютере (значок появится в трее)'
+  $l.Save()
+}}
+"""
+    r = _ps(ps)
+    print('Ярлыки «%s» — на рабочем столе и в меню «Пуск».' % SHORTCUT if r.returncode == 0 else 'Ярлыки не созданы: ' + (r.stderr or '')[:300])
+
+
+def remove_extras():
+    _ps(f"""
+foreach ($dir in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {{
+  Remove-Item -LiteralPath (Join-Path $dir '{SHORTCUT}.lnk') -ErrorAction SilentlyContinue
+}}
+""")
 
 
 def setup(cfg):
@@ -788,6 +938,12 @@ def setup(cfg):
 
 
 def main():
+    if '--install-extras' in sys.argv:
+        install_extras()
+        return
+    if '--remove-extras' in sys.argv:
+        remove_extras()
+        return
     cfg = load_config()
     if '--setup' in sys.argv:
         sys.exit(setup(cfg))
@@ -799,7 +955,16 @@ def main():
     if '--once' in sys.argv:
         a.tick()
         return
-    a.run()
+    if not single_instance():
+        return
+    run_tray(a)
+    if globals().get('_RESTART'):
+        import ctypes
+        import subprocess
+        if os.name == 'nt':
+            ctypes.windll.kernel32.CloseHandle(globals()['_MUTEX'])
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=INSTALL_DIR)
+    os._exit(0)  # фоновые потоки (отметка «в сети», загрузка) не держат программу
 
 
 if __name__ == '__main__':

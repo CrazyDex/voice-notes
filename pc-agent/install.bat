@@ -41,7 +41,7 @@ if defined VNPROXY (
   set "HTTPS_PROXY=%VNPROXY%"
 )
 "%PY%" -m pip install --upgrade pip
-"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests sherpa-onnx nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests sherpa-onnx pystray pillow nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
 if not errorlevel 1 goto pip_ok
 if not defined VNPROXY goto pip_fail
 echo.
@@ -50,7 +50,7 @@ set "HTTP_PROXY="
 set "HTTPS_PROXY="
 set "NO_PROXY=*"
 "%PY%" -m pip install --upgrade pip
-"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests sherpa-onnx nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+"%PY%" -m pip install --upgrade "faster-whisper>=1.1" requests sherpa-onnx pystray pillow nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
 if not errorlevel 1 (
   echo {"proxy": "off"}> "%APPDATA%\voice-notes-agent\proxy.json"
   goto pip_ok
@@ -61,6 +61,8 @@ echo  Ошибка установки библиотек. Сделайте сн�
 pause
 exit /b 1
 :pip_ok
+rem старая копия (в т. ч. запущенная ярлыком) должна закрыться, иначе файл занят и останутся две
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'pythonw.exe' -and $_.CommandLine -like '*vn_agent.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 copy /y "%~dp0vn_agent.py" "%DIR%\vn_agent.py" >nul
 copy /y "%~dp0proxy_fix.py" "%DIR%\proxy_fix.py" >nul
 
@@ -87,6 +89,11 @@ if errorlevel 1 (
 )
 
 echo.
+"%PY%" "%DIR%\vn_agent.py" --install-extras
+echo.
 echo  Всё готово. Программа работает в фоне и сама запускается при входе в Windows.
+echo  Её значок - в трее справа внизу, у часов (может прятаться под стрелкой). Правый щелчок - меню и «Выход».
+echo  Запустить снова: ярлык «Голосовые заметки (ПК)» на рабочем столе или в меню «Пуск».
+echo  Программа установлена в %DIR%
 echo  Журнал работы: %APPDATA%\voice-notes-agent\agent.log  (или show-log.bat)
 pause
