@@ -18,7 +18,7 @@ const ls = {
 };
 const S = Object.assign({}, DEFAULTS, ls.get('vn.settings', {}));
 const saveS = () => ls.set('vn.settings', S);
-const VERSION = '1.16';
+const VERSION = '1.17';
 if (!MODELS[S.model]) S.model = DEFAULTS.model;
 // v0.4: на iPhone один раз переводим на Base — Small в Safari вылетал по памяти
 if (IS_IOS && !ls.get('vn.mig04', false)) { if (S.model === 'small' || S.model === 'medium') S.model = 'base'; S.device = 'auto'; ls.set('vn.mig04', true); saveS(); }
@@ -1327,10 +1327,14 @@ async function sendMeeting(n, speakers) {
   if (!parts.length) { toast('У записи нет сохранённого аудио'); return; }
   const prev = n.meeting || {};
   n.meeting = { id: 'meet', names: prev.names || {}, speakers, parts, pc: { state: 'outbox', sentAt: Date.now() } };
-  if (prev.segs) n.meeting.prevSegs = prev.segs; // прежняя расшифровка видна, пока не придёт новая
+  if (prev.segs || prev.prevSegs) Object.assign(n.meeting, { prevSegs: prev.segs || prev.prevSegs, nspk: prev.nspk, audioSec: prev.audioSec }); // прежняя расшифровка видна, пока не придёт новая
   saveNote(n); trace(`встреча: в очередь ${n.id}, частей ${parts.length}, ${Math.round(parts.reduce((a, p) => a + p.dur, 0) / 60)} мин`);
   toast(pcOnlineText().on ? 'Отправляю запись на компьютер…' : 'Компьютер не отвечает — задание будет ждать в очереди');
   pcSync();
+}
+// заново (например, после обновления программы на ПК): прежняя расшифровка видна, пока не придёт новая
+function redoMeeting(n) {
+  askSpeakers(async (k) => { await sendMeeting(n, k); if (location.hash === '#/m/' + encodeURIComponent(n.id)) renderMeeting(n.id); else location.hash = '#/m/' + encodeURIComponent(n.id); });
 }
 function openMeeting(n) {
   if (n.meeting) { location.hash = '#/m/' + encodeURIComponent(n.id); return; }
@@ -1389,7 +1393,8 @@ function renderMeeting(id) {
   const back = n.stream ? '#/s/' + encodeURIComponent(n.id) : '#/n/' + encodeURIComponent(n.id);
   app.innerHTML = `
   <header class="top"><div class="wrap row"><a class="iconbtn" href="${back}" aria-label="Назад">${I.back}</a>
-    <div class="grow small">📝 Встреча · ${esc(titleOf(n))}${mt.audioSec ? ' · ' + fmtTs(mt.audioSec) : ''}</div></div></header>
+    <div class="grow small">📝 Встреча · ${esc(titleOf(n))}${mt.audioSec ? ' · ' + fmtTs(mt.audioSec) : ''}</div>
+    ${segs.length && !pcActive(mt) ? '<button class="iconbtn" id="mredo2" aria-label="Расшифровать заново" title="Расшифровать заново">↻</button>' : ''}</div></header>
   <main class="wrap" style="padding-bottom:150px">
     <div id="mstat">${meetingStatusHTML(n)}</div>
     ${segs.length ? `
@@ -1456,7 +1461,8 @@ function renderMeeting(id) {
     notes.unshift(m); saveNote(m); toast('Заметка создана'); location.hash = '#/n/' + encodeURIComponent(m.id);
   };
   $('#mshare').onclick = () => shareAudio(() => meetingBlob(n), audioName(n));
-  $('#mredo').onclick = () => askSpeakers((k) => { sendMeeting(n, k); renderMeeting(id); });
+  $('#mredo').onclick = () => redoMeeting(n);
+  const mr2 = $('#mredo2'); if (mr2) mr2.onclick = () => redoMeeting(n);
   $('#mdel').onclick = async () => { if (!confirm('Удалить расшифровку встречи? Аудио и заметка останутся.')) return; delete n.meeting; saveNote(n); location.hash = back; };
 }
 
@@ -1481,6 +1487,7 @@ function renderStream(id, scrollNew) {
   const s = notes.find((x) => x.id === id);
   if (!s) { app.innerHTML = '<div class="wrap empty">Поток не найден. <a href="#/streams">К потокам</a></div>'; return; }
   const fs = s.frags || [], nNew = fs.filter((f) => f.isNew).length, nCan = fs.filter(pcCan).length;
+  const nRedo = fs.filter((f) => f.hasAudio && pcDone(f)).length;
   const edit = renderStream.edit || null;
   app.innerHTML = `
   <header class="top"><div class="wrap row">
@@ -1490,7 +1497,8 @@ function renderStream(id, scrollNew) {
   <main class="wrap" style="padding-bottom:130px">
     <input class="title-in" id="stitle" value="${esc(s.title)}">
     ${nNew > 1 || (pcOn() && nCan) ? `<div class="btns" style="margin:4px 0 10px">${nNew > 1 ? `<button class="btn" id="keepall">✓ Оставить все новые (${nNew})</button>` : ''}${pcOn() && nCan ? `<button class="btn" id="spcall">🖥 Распознать все на ПК (${nCan})</button>` : ''}</div>` : ''}
-    ${fs.some((f) => f.hasAudio) || s.meeting ? `<div class="btns" style="margin:0 0 10px"><button class="btn" id="smeet">${meetingBtnLabel(s)}</button>${fs.some((f) => f.hasAudio) ? '<button class="btn" id="sshare">⤴ Аудио потока</button>' : ''}</div>` : ''}
+    ${pcOn() && !nCan && nRedo > 1 ? `<div class="btns" style="margin:4px 0 10px"><button class="btn" id="spcredo">↻ Распознать все заново (${nRedo})</button></div>` : ''}
+    ${fs.some((f) => f.hasAudio) || s.meeting ? `<div class="btns" style="margin:0 0 10px"><button class="btn" id="smeet">${meetingBtnLabel(s)}</button>${s.meeting?.segs && pcOn() ? '<button class="btn" id="smredo" title="Расшифровать встречу заново">↻ Заново</button>' : ''}${fs.some((f) => f.hasAudio) ? '<button class="btn" id="sshare">⤴ Аудио потока</button>' : ''}</div>` : ''}
     ${pcOn() && fs.length && !nCan && fs.some(pcDone) ? `<div class="small" style="margin:0 0 10px">🖥 ✓ — распознано на компьютере.</div>` : ''}
     ${fs.length ? '' : '<div class="empty">Пока пусто. Нажмите красную кнопку и говорите подряд; между мыслями нажимайте «Следующая мысль».</div>'}
     ${fs.map((f, i) => `<div class="card frag${f.isNew ? ' new' : ''}" data-frag="${f.id}">
@@ -1504,6 +1512,7 @@ function renderStream(id, scrollNew) {
         ${f.isNew ? `<button class="btn" data-fkeep="${f.id}">✓ Оставить</button>` : ''}
         <button class="btn" data-fed="${f.id}">${edit === f.id ? 'Готово' : '✎'}</button>
         ${pcOn() && pcCan(f) ? `<button class="btn" data-ftopc="${f.id}" title="Распознать на ПК">🖥</button>` : ''}
+        ${pcOn() && f.hasAudio && pcDone(f) ? `<button class="btn" data-fredo="${f.id}" title="Распознать на ПК заново">↻</button>` : ''}
         <button class="btn danger" data-fdel="${f.id}">🗑</button>
       </div></div>`).join('<div style="height:10px"></div>')}
     <div class="btns" style="margin-top:18px"><button class="btn" id="scopy">📋 Скопировать весь текст</button><button class="btn danger" id="sdel">Удалить поток</button></div>
@@ -1523,6 +1532,18 @@ function renderStream(id, scrollNew) {
   };
   const fab = $('#sfab'); if (fab) fab.onclick = () => startStream(s);
   const sm = $('#smeet'); if (sm) sm.onclick = () => openMeeting(s);
+  const smr = $('#smredo'); if (smr) smr.onclick = () => redoMeeting(s);
+  app.querySelectorAll('[data-fredo]').forEach((b) => (b.onclick = () => {
+    const f = get(b.dataset.fredo); if (!f) return;
+    f.pc = { state: 'outbox', sentAt: Date.now() }; saveNote(s); redraw();
+    toast(pcOnlineText().on ? 'Отправляю на компьютер заново…' : 'Компьютер не отвечает — задание будет ждать в очереди'); pcSync();
+  }));
+  const pr = $('#spcredo'); if (pr) pr.onclick = () => {
+    const list = fs.filter((f) => f.hasAudio && pcDone(f));
+    if (!confirm(`Распознать на компьютере заново все мысли (${list.length})? Мысли, которые вы правили, не заменятся — появится выбор.`)) return;
+    for (const f of list) f.pc = { state: 'outbox', sentAt: Date.now() };
+    saveNote(s); redraw(); toast(`Отправляю заново: ${list.length}`); pcSync();
+  };
   const ssh = $('#sshare'); if (ssh) ssh.onclick = () => shareAudio(() => meetingBlob(s, meetingKeys(s)), audioName(s));
   const pa = $('#spcall'); if (pa) pa.onclick = () => {
     const list = fs.filter(pcCan); if (!list.length) return;
@@ -1753,9 +1774,9 @@ function renderNote(id) {
     ${n.hasAudio || !clips.length ? `${clips.length ? '<div class="small" style="margin-bottom:4px">Первая запись</div>' : ''}<div id="naudio" class="small">${n.hasAudio ? 'Загрузка…' : 'Не сохранено'}</div>` : ''}
     <div class="btns" style="margin-top:10px">
       ${pcCan(n) ? `<button class="btn" id="topc">🖥 Распознать на ПК</button>` : ''}
-      ${n.hasAudio && pcDone(n) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере${n.pc.model ? ' (' + esc(n.pc.model) + ')' : ''} · <a id="topcagain">ещё раз</a></span>` : ''}
+      ${n.hasAudio && pcDone(n) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере${n.pc.model ? ' (' + esc(n.pc.model) + ')' : ''}</span>${pcOn() ? '<button class="btn" id="topcagain" title="Распознать на ПК заново">↻ Распознать заново</button>' : ''}` : ''}
       ${meetingKeys(n).length > 1 ? `<button class="btn" id="nshareall">⤴ Всё аудио одним файлом</button>` : ''}
-      ${n.hasAudio || clips.some((c) => c.hasAudio) || n.meeting ? `<button class="btn" id="nmeet">${meetingBtnLabel(n)}</button>` : ''}
+      ${n.hasAudio || clips.some((c) => c.hasAudio) || n.meeting ? `<button class="btn" id="nmeet">${meetingBtnLabel(n)}</button>` : ''}${n.meeting?.segs && pcOn() ? '<button class="btn" id="nmredo" title="Расшифровать встречу заново">↻ Встречу заново</button>' : ''}
       ${pcOn() && [n, ...clips].filter(pcCan).length > 1 ? `<button class="btn" id="topcall">🖥 Распознать все записи (${[n, ...clips].filter(pcCan).length})</button>` : ''}
       ${n.hasAudio && !IS_IOS && !clips.length ? `<button class="btn" id="retr">↻ Перераспознать (${MODELS[S.model].name})</button>` : ''}
       ${clips.length ? '' : '<button class="btn" id="ncopy">📋 Скопировать весь текст</button><button class="btn danger" id="del">Удалить</button>'}
@@ -1766,7 +1787,7 @@ function renderNote(id) {
       <div data-cpcbox="${c.id}">${pcBoxHTML(c, c.id)}</div>
       <div class="btns" style="margin-top:8px">
         ${pcCan(c) ? `<button class="btn" data-ctopc="${c.id}">🖥 Распознать на ПК</button>` : ''}
-        ${c.hasAudio && pcDone(c) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере · <a data-ctopcagain="${c.id}">ещё раз</a></span>` : ''}
+        ${c.hasAudio && pcDone(c) ? `<span class="pcok big">🖥 ✓ Распознано на компьютере</span>${pcOn() ? `<button class="btn" data-ctopcagain="${c.id}" title="Распознать на ПК заново">↻ Заново</button>` : ''}` : ''}
         <button class="btn danger" data-cdel="${c.id}">Удалить аудио</button>
       </div></div>`).join('')}
     ${clips.length ? '<div class="btns" style="margin-top:14px"><button class="btn" id="ncopy">📋 Скопировать весь текст</button><button class="btn danger" id="del">Удалить заметку</button></div>' : ''}
@@ -1817,6 +1838,7 @@ function renderNote(id) {
   const tp = $('#topc'); if (tp) tp.onclick = () => sendToPC(n);
   const tpa = $('#topcagain'); if (tpa) tpa.onclick = () => { if (confirm('Распознать на компьютере ещё раз? Если текст не правили, он заменится, прежний останется в «Прежних вариантах».')) { n.pc = null; sendToPC(n); } };
   const nm = $('#nmeet'); if (nm) nm.onclick = () => openMeeting(n);
+  const nmr = $('#nmredo'); if (nmr) nmr.onclick = () => redoMeeting(n);
   const nsa = $('#nshareall'); if (nsa) nsa.onclick = () => shareAudio(() => meetingBlob(n, meetingKeys(n)), audioName(n));
   const tpall = $('#topcall'); if (tpall) tpall.onclick = async () => {
     const list = [n, ...clips].filter(pcCan);
